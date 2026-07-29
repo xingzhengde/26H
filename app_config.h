@@ -31,7 +31,7 @@
 #define LINE_CORRECTION_SIGN    (1)
 
 #define BUTTON_REARM_MS         (200U)
-#define OLED_RUNTIME_ENABLE     (0)
+#define OLED_RUNTIME_ENABLE     (1)
 #define CONTROL_LAG_WARN_MS     (60U)
 
 #define LEFT_MOTOR_INVERT       (0)

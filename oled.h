@@ -143,6 +143,7 @@ static inline const uint8_t *oled_font5x7(char c)
     };
     static const uint8_t blank[5] = {0, 0, 0, 0, 0};
     static const uint8_t colon[5] = {0x00, 0x36, 0x36, 0x00, 0x00};
+    static const uint8_t dot[5] = {0x00, 0x60, 0x60, 0x00, 0x00};
     static const uint8_t minus[5] = {0x08, 0x08, 0x08, 0x08, 0x08};
 
     if ((c >= '0') && (c <= '9')) {
@@ -156,6 +157,9 @@ static inline const uint8_t *oled_font5x7(char c)
     }
     if (c == ':') {
         return colon;
+    }
+    if (c == '.') {
+        return dot;
     }
     if (c == '-') {
         return minus;
@@ -183,6 +187,32 @@ static inline void oled_puts(uint8_t page, uint8_t col, const char *text)
         }
         out[5] = 0x00U;
         (void)oled_data(out, 6U);
+    }
+}
+
+static inline void oled_puts_fixed(uint8_t page, uint8_t col,
+                                   const char *text, uint8_t width)
+{
+    uint8_t count = 0U;
+
+    oled_set_pos(page, col);
+    while ((*text != '\0') && (count < width)) {
+        uint8_t out[6];
+        const uint8_t *glyph = oled_font5x7(*text++);
+        uint8_t i;
+
+        for (i = 0U; i < 5U; i++) {
+            out[i] = glyph[i];
+        }
+        out[5] = 0x00U;
+        (void)oled_data(out, 6U);
+        count++;
+    }
+    while (count < width) {
+        uint8_t out[6] = {0};
+
+        (void)oled_data(out, 6U);
+        count++;
     }
 }
 
@@ -275,19 +305,41 @@ static inline void oled_make_line(char *dst, const char *label, int32_t value)
     oled_i32_to_text(&dst[i], value);
 }
 
+static inline void oled_make_time_text(char *dst, uint32_t run_time_ms)
+{
+    uint32_t total_tenths = run_time_ms / 100U;
+    uint32_t minutes = total_tenths / 600U;
+    uint32_t seconds = (total_tenths / 10U) % 60U;
+    uint32_t tenths = total_tenths % 10U;
+
+    dst[0] = 'T';
+    dst[1] = 'I';
+    dst[2] = 'M';
+    dst[3] = 'E';
+    dst[4] = ':';
+    dst[5] = (char)('0' + ((minutes / 10U) % 10U));
+    dst[6] = (char)('0' + (minutes % 10U));
+    dst[7] = ':';
+    dst[8] = (char)('0' + ((seconds / 10U) % 10U));
+    dst[9] = (char)('0' + (seconds % 10U));
+    dst[10] = '.';
+    dst[11] = (char)('0' + tenths);
+    dst[12] = 'S';
+    dst[13] = '\0';
+}
+
 static inline void oled_show_motion(const MotionState *state,
                                     uint32_t run_time_ms,
                                     bool running)
 {
     char line[20];
-    uint32_t run_time_s = run_time_ms / 1000U;
 
-    oled_puts(0U, 0U, running ? "MODE:RUN" : "MODE:STOP");
-    oled_make_line(line, "TIME:", (int32_t)run_time_s);
-    oled_puts(2U, 0U, line);
-    oled_make_line(line, "ACC:", state->accel_cps2);
-    oled_puts(4U, 0U, line);
-    oled_puts(6U, 0U, "UNIT:CPS2");
+    (void)state;
+    oled_puts_fixed(0U, 0U, "26H CAR", 21U);
+    oled_puts_fixed(2U, 0U, running ? "MODE:RUN" : "MODE:STOP", 21U);
+    oled_make_time_text(line, run_time_ms);
+    oled_puts_fixed(4U, 0U, line, 21U);
+    oled_puts_fixed(6U, 0U, "B15 START B5 STOP", 21U);
 }
 
 #endif
