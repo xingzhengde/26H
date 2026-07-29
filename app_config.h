@@ -30,6 +30,10 @@
 #define LINE_SEARCH_PWM         (0)
 #define LINE_CORRECTION_SIGN    (1)
 
+#define BUTTON_REARM_MS         (200U)
+#define OLED_RUNTIME_ENABLE     (0)
+#define CONTROL_LAG_WARN_MS     (60U)
+
 #define LEFT_MOTOR_INVERT       (0)
 #define RIGHT_MOTOR_INVERT      (0)
 #define LEFT_ENCODER_INVERT     (0)

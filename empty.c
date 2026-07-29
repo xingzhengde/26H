@@ -110,39 +110,43 @@ static bool b15_pressed(void)
     return (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_15) == 0U);
 }
 
-static bool debounce_press_event(bool pressed, bool *armed, uint32_t *stable_ms)
+static bool button_latched_event(bool pressed, bool *wait_release,
+                                 uint32_t *rearm_until_ms)
 {
-    bool event = false;
-
-    if (pressed) {
-        if (*stable_ms == 0U) {
-            *stable_ms = g_ms_ticks;
-        }
-        if (*armed && ((g_ms_ticks - *stable_ms) >= 30U)) {
-            event = true;
-            *armed = false;
-        }
-    } else {
-        *stable_ms = 0U;
-        *armed = true;
+    if ((int32_t)(g_ms_ticks - *rearm_until_ms) < 0) {
+        return false;
     }
-    return event;
+
+    if (*wait_release) {
+        if (!pressed) {
+            *wait_release = false;
+            *rearm_until_ms = g_ms_ticks + BUTTON_REARM_MS;
+        }
+        return false;
+    }
+
+    if (!pressed) {
+        return false;
+    }
+
+    *wait_release = true;
+    return true;
 }
 
 static bool b5_press_event(void)
 {
-    static bool armed = true;
-    static uint32_t stable_ms;
+    static bool wait_release;
+    static uint32_t rearm_until_ms;
 
-    return debounce_press_event(b5_pressed(), &armed, &stable_ms);
+    return button_latched_event(b5_pressed(), &wait_release, &rearm_until_ms);
 }
 
 static bool b15_press_event(void)
 {
-    static bool armed = true;
-    static uint32_t stable_ms;
+    static bool wait_release;
+    static uint32_t rearm_until_ms;
 
-    return debounce_press_event(b15_pressed(), &armed, &stable_ms);
+    return button_latched_event(b15_pressed(), &wait_release, &rearm_until_ms);
 }
 
 static bool buttons_released(void)
@@ -169,6 +173,18 @@ static void start_line_tracking(TuneParams *tune)
     g_run_time_ms = 0U;
     g_run_timer_enabled = true;
     debug_puts("RUN TIME START\r\n");
+}
+
+static void debug_print_keys(const char *tag, const TuneParams *tune)
+{
+    debug_puts(tag);
+    debug_puts(" B5=");
+    debug_print_i32(b5_pressed() ? 1 : 0);
+    debug_puts(" B15=");
+    debug_print_i32(b15_pressed() ? 1 : 0);
+    debug_puts(" RUN=");
+    debug_print_i32(tune->run ? 1 : 0);
+    debug_puts("\r\n");
 }
 
 void RUN_TIMER_INST_IRQHandler(void)
@@ -202,7 +218,11 @@ int main(void)
     PidController left_pid;
     PidController right_pid;
     uint32_t last_control_ms = 0;
+#if OLED_RUNTIME_ENABLE
     uint32_t last_oled_ms = 0;
+#endif
+    uint32_t last_lag_report_ms = 0;
+    uint32_t last_boot_key_report_ms = 0;
     uint32_t brake_until_ms = 0;
     MotionState motion;
     int left_speed = 0;
@@ -213,39 +233,39 @@ int main(void)
     int oled_status;
 
     SYSCFG_DL_init();
+    motor_init();
     NVIC_EnableIRQ(RUN_TIMER_INST_INT_IRQN);
     __enable_irq();
     while (g_ms_ticks < 200U) {
         __NOP();
     }
 
-    motor_init();
     encoder_init();
     motion_state_init(&motion);
     line_tracker_init(&tracker);
     uart_tune_init(&tune);
     uart_tune_clear_rx();
+#if OLED_RUNTIME_ENABLE
     oled_status = oled_init();
     if (oled_status >= 0) {
-        oled_force_all_on(true);
-        {
-            uint32_t test_until_ms = g_ms_ticks + 1500U;
-            while ((int32_t)(g_ms_ticks - test_until_ms) < 0) {
-                __NOP();
-            }
-        }
-        oled_force_all_on(false);
         oled_clear();
         oled_puts(0U, 0U, "OLED:OK");
     } else {
         (void)oled_status;
     }
+#else
+    (void)oled_status;
+#endif
     tune.line_active = false;
 
     pid_init(&left_pid, tune.kp, tune.ki, tune.kd, tune.target,
         DEFAULT_MAX_INTEGRAL, DEFAULT_MAX_OUTPUT);
     pid_init(&right_pid, tune.kp, tune.ki, tune.kd, tune.target,
         DEFAULT_MAX_INTEGRAL, DEFAULT_MAX_OUTPUT);
+    last_control_ms = g_ms_ticks;
+#if OLED_RUNTIME_ENABLE
+    last_oled_ms = g_ms_ticks;
+#endif
 
     while (1) {
         if (g_ms_ticks < STARTUP_SAFE_MS) {
@@ -262,10 +282,15 @@ int main(void)
         if (!g_buttons_released_after_boot) {
             if (buttons_released()) {
                 g_buttons_released_after_boot = true;
+                debug_print_keys("BOOT READY", &tune);
             } else {
                 tune.run = false;
                 tune.line_active = false;
                 motor_stop();
+                if ((g_ms_ticks - last_boot_key_report_ms) >= 500U) {
+                    last_boot_key_report_ms = g_ms_ticks;
+                    debug_print_keys("BOOT WAIT KEYS", &tune);
+                }
                 continue;
             }
         }
@@ -307,14 +332,17 @@ int main(void)
         }
 
         if (b5_press_event()) {
+            debug_print_keys("KEY B5 STOP", &tune);
             stop_car(&tune);
         }
 
         if (b15_press_event()) {
-            if (tune.run) {
-                stop_car(&tune);
-            } else {
+            debug_print_keys("KEY B15 EVENT", &tune);
+            if (!tune.run) {
+                debug_puts("KEY B15 START\r\n");
                 start_line_tracking(&tune);
+            } else {
+                debug_puts("KEY B15 IGNORED RUNNING\r\n");
             }
         }
 
@@ -331,8 +359,19 @@ int main(void)
             int32_t right_delta;
             int32_t target_left_pwm = 0;
             int32_t target_right_pwm = 0;
+            uint32_t control_elapsed_ms = g_ms_ticks - last_control_ms;
 
-            last_control_ms += SPEED_CTRL_PERIOD_MS;
+            if (control_elapsed_ms > CONTROL_LAG_WARN_MS) {
+                last_control_ms = g_ms_ticks;
+                if ((g_ms_ticks - last_lag_report_ms) >= 1000U) {
+                    last_lag_report_ms = g_ms_ticks;
+                    debug_puts("CTRL LAG MS ");
+                    debug_print_i32((int32_t)control_elapsed_ms);
+                    debug_puts("\r\n");
+                }
+            } else {
+                last_control_ms += SPEED_CTRL_PERIOD_MS;
+            }
             encoder_get_delta(&left_delta, &right_delta);
             motion_state_update(&motion, left_delta, right_delta,
                 SPEED_CTRL_PERIOD_MS);
@@ -399,10 +438,12 @@ int main(void)
             }
         }
 
+#if OLED_RUNTIME_ENABLE
         if ((g_ms_ticks - last_oled_ms) >= 200U) {
             last_oled_ms += 200U;
             oled_show_motion(&motion, g_run_time_ms, tune.run);
         }
+#endif
 
     }
 }

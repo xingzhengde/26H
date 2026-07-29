@@ -21,7 +21,6 @@ const GPIO_DIR     = GPIO.addInstance();
 const GPIO_INPUTS  = GPIO.addInstance();
 const GPIO_STEPPER = GPIO.addInstance();
 const I2C_OLED     = I2C.addInstance();
-const MOTOR_PWM    = PWM.addInstance();
 const STEPPER_PWM  = PWM.addInstance();
 const RUN_TIMER    = TIMER.addInstance();
 const DEBUG_UART   = UART.addInstance();
@@ -143,17 +142,6 @@ GPIO_INPUTS.associatedPins[13].internalResistor = "PULL_UP";
 GPIO_INPUTS.associatedPins[13].interruptEn = true;
 GPIO_INPUTS.associatedPins[13].polarity = "RISE_FALL";
 GPIO_INPUTS.associatedPins[13].pin.$assign = "PA14";
-
-MOTOR_PWM.$name = "MOTOR_PWM";
-MOTOR_PWM.timerCount = 1600;
-MOTOR_PWM.dutyArgs = "[0,0,0,0]";
-MOTOR_PWM.enableShadowLoad = false;
-MOTOR_PWM.timerStartTimer = true;
-MOTOR_PWM.peripheral.$assign = "TIMG0";
-MOTOR_PWM.peripheral.ccp0Pin.$assign = "PA12";
-MOTOR_PWM.peripheral.ccp1Pin.$assign = "PA13";
-MOTOR_PWM.PWM_CHANNEL_0.$name = "PWMA_RIGHT_REAR";
-MOTOR_PWM.PWM_CHANNEL_1.$name = "PWMB_LEFT_REAR";
 
 STEPPER_PWM.$name = "STEPPER_PWM";
 STEPPER_PWM.timerCount = 1600;
