@@ -1,41 +1,44 @@
-## Example Summary
+# 26H 车载平衡滚球运动控制系统
 
-Empty project using DriverLib.
-This example shows a basic empty project using DriverLib with just main file
-and SysConfig initialization.
+本工程是 MSPM0G3507 上的 H 题控制程序，当前主线目标是完成“循线小车 + 车载滚球平衡控制”的全部题目要求。
 
-## Peripherals & Pin Assignments
+题目原文位于：
 
-| Peripheral | Pin | Function |
-| --- | --- | --- |
-| SYSCTL |  |  |
-| DEBUGSS | PA20 | Debug Clock |
-| DEBUGSS | PA19 | Debug Data In Out |
+- `D:\codexProjects\electronicCompetition_test\题目\H题_车载平衡滚球运动控制系统.pdf`
 
-## BoosterPacks, Board Resources & Jumper Settings
+工程状态、题目要求和下一步路线见：
 
-Visit [LP_MSPM0G3507](https://www.ti.com/tool/LP-MSPM0G3507) for LaunchPad information, including user guide and hardware files.
+- [H_REQUIREMENTS.md](H_REQUIREMENTS.md)
 
-| Pin | Peripheral | Function | LaunchPad Pin | LaunchPad Settings |
-| --- | --- | --- | --- | --- |
-| PA20 | DEBUGSS | SWCLK | N/A | <ul><li>PA20 is used by SWD during debugging<br><ul><li>`J101 15:16 ON` Connect to XDS-110 SWCLK while debugging<br><li>`J101 15:16 OFF` Disconnect from XDS-110 SWCLK if using pin in application</ul></ul> |
-| PA19 | DEBUGSS | SWDIO | N/A | <ul><li>PA19 is used by SWD during debugging<br><ul><li>`J101 13:14 ON` Connect to XDS-110 SWDIO while debugging<br><li>`J101 13:14 OFF` Disconnect from XDS-110 SWDIO if using pin in application</ul></ul> |
+## 当前固件状态
 
-### Device Migration Recommendations
-This project was developed for a superset device included in the LP_MSPM0G3507 LaunchPad. Please
-visit the [CCS User's Guide](https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/tools/ccs_ide_guide/doc_guide/doc_guide-srcs/ccs_ide_guide.html#sysconfig-project-migration)
-for information about migrating to other MSPM0 devices.
+- 主控：MSPM0G3507。
+- 驱动：后驱二轮小车，TB6612 A 通道为右后轮，B 通道为左后轮。
+- 启停：B15 启动循迹，B5 停止并通过串口输出本次运行时间。
+- 串口调参：UART1，PB6=TX，PB7=RX，9600 8N1。
+- 备用串口：UART2，PA23=TX，PA24=RX，115200 8N1。
+- 循迹：8 路灰度传感器 OUT1~OUT8。
+- OLED：I2C0，PA28=SDA，PA31=SCL；当前 `OLED_RUNTIME_ENABLE=0`，因为已确认旧 OLED 模块故障。
+- 步进电机 PWM：PA30，TIMG6 CCP1；方向/休眠/复位等控制脚已预留。
 
-### Low-Power Recommendations
-TI recommends to terminate unused pins by setting the corresponding functions to
-GPIO and configure the pins to output low or input with internal
-pullup/pulldown resistor.
+## 串口命令
 
-SysConfig allows developers to easily configure unused pins by selecting **Board**→**Configure Unused Pins**.
+常用命令以换行结束，大小写均可：
 
-For more information about jumper configuration to achieve low-power using the
-MSPM0 LaunchPad, please visit the [LP-MSPM0G3507 User's Guide](https://www.ti.com/lit/slau873).
+- `R`：启动。
+- `S`：停止并刹车。
+- `T120`：设置速度闭环目标编码器计数。
+- `B255`：设置基础 PWM。
+- `P1.2 I0.003 D0`：设置左右轮速度闭环 PID。
+- `LP2.45 LD1.0 LC200`：设置循迹 PD 和差速限幅。
+- `BR-14`：设置右轮补偿。
 
-## Example Usage
+## 构建
 
-Compile, load and run the example.
+在 `C:\Users\29543\workspace_ccstheia\PID\Debug` 下执行：
+
+```powershell
+& 'E:\CCS\CCS21.0\ccs\utils\bin\gmake.exe' clean all
+```
+
+代码修改后必须完整 build，并确认没有 error 和 warning。
