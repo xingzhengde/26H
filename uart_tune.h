@@ -33,7 +33,8 @@ void uart_tune_clear_rx(void);
 bool uart_tune_poll(TuneParams *params);
 void uart_tune_send_status(const TuneParams *params, int left_speed,
                            int right_speed, int left_pwm, int right_pwm,
-                           uint8_t gray_raw, uint8_t key_raw);
+                           uint8_t gray_raw, uint8_t key_raw,
+                           uint32_t run_time_ms);
 void uart_tune_send_help(void);
 
 #endif

@@ -2,7 +2,9 @@
 #include "encoder.h"
 #include "gray_sensor.h"
 #include "line_tracker.h"
+#include "motion_state.h"
 #include "motor.h"
+#include "oled.h"
 #include "pid.h"
 #include "ti_msp_dl_config.h"
 #include "uart_tune.h"
@@ -10,7 +12,53 @@
 #include <stdint.h>
 
 static volatile uint32_t g_ms_ticks;
+static volatile uint32_t g_run_time_ms;
+static volatile bool g_run_timer_enabled;
 static bool g_buttons_released_after_boot;
+
+static void debug_putc(char ch)
+{
+    DL_UART_Main_transmitDataBlocking(UART_0_INST, (uint8_t)ch);
+}
+
+static void debug_puts(const char *text)
+{
+    while (*text != '\0') {
+        debug_putc(*text++);
+    }
+}
+
+static void debug_print_i32(int32_t value)
+{
+    char digits[11];
+    uint8_t index = 0U;
+    uint32_t mag;
+
+    if (value < 0) {
+        debug_putc('-');
+        mag = (uint32_t)(-value);
+    } else {
+        mag = (uint32_t)value;
+    }
+    do {
+        digits[index++] = (char)('0' + (mag % 10U));
+        mag /= 10U;
+    } while ((mag != 0U) && (index < (uint8_t)sizeof(digits)));
+
+    while (index > 0U) {
+        debug_putc(digits[--index]);
+    }
+}
+
+static uint32_t run_time_snapshot_ms(void)
+{
+    uint32_t value;
+
+    __disable_irq();
+    value = g_run_time_ms;
+    __enable_irq();
+    return value;
+}
 
 static int16_t ramp_to(int16_t current, int16_t target, int16_t step)
 {
@@ -102,24 +150,15 @@ static bool buttons_released(void)
     return !b5_pressed() && !b15_pressed();
 }
 
-static uint8_t key_state_raw(void)
-{
-    uint8_t bits = 0U;
-
-    if (b5_pressed()) {
-        bits |= 0x01U;
-    }
-    if (b15_pressed()) {
-        bits |= 0x02U;
-    }
-    return bits;
-}
-
 static void stop_car(TuneParams *tune)
 {
     tune->run = false;
     tune->line_active = false;
     tune->brake_request = true;
+    g_run_timer_enabled = false;
+    debug_puts("RUN TIME MS ");
+    debug_print_i32((int32_t)run_time_snapshot_ms());
+    debug_puts("\r\n");
 }
 
 static void start_line_tracking(TuneParams *tune)
@@ -127,11 +166,23 @@ static void start_line_tracking(TuneParams *tune)
     tune->run = true;
     tune->line_active = true;
     tune->reset_pid = true;
+    g_run_time_ms = 0U;
+    g_run_timer_enabled = true;
+    debug_puts("RUN TIME START\r\n");
 }
 
-void SysTick_Handler(void)
+void RUN_TIMER_INST_IRQHandler(void)
 {
-    g_ms_ticks++;
+    switch (DL_Timer_getPendingInterrupt(RUN_TIMER_INST)) {
+        case DL_TIMER_IIDX_ZERO:
+            g_ms_ticks++;
+            if (g_run_timer_enabled) {
+                g_run_time_ms++;
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 void GROUP1_IRQHandler(void)
@@ -151,24 +202,44 @@ int main(void)
     PidController left_pid;
     PidController right_pid;
     uint32_t last_control_ms = 0;
-    uint32_t last_report_ms = 0;
+    uint32_t last_oled_ms = 0;
     uint32_t brake_until_ms = 0;
+    MotionState motion;
     int left_speed = 0;
     int right_speed = 0;
     int16_t left_pwm = 0;
     int16_t right_pwm = 0;
     uint8_t gray_raw = 0U;
-    uint8_t key_raw = 0U;
+    int oled_status;
 
     SYSCFG_DL_init();
-    SysTick_Config(CPUCLK_FREQ / 1000U);
+    NVIC_EnableIRQ(RUN_TIMER_INST_INT_IRQN);
     __enable_irq();
+    while (g_ms_ticks < 200U) {
+        __NOP();
+    }
 
     motor_init();
     encoder_init();
+    motion_state_init(&motion);
     line_tracker_init(&tracker);
     uart_tune_init(&tune);
     uart_tune_clear_rx();
+    oled_status = oled_init();
+    if (oled_status >= 0) {
+        oled_force_all_on(true);
+        {
+            uint32_t test_until_ms = g_ms_ticks + 1500U;
+            while ((int32_t)(g_ms_ticks - test_until_ms) < 0) {
+                __NOP();
+            }
+        }
+        oled_force_all_on(false);
+        oled_clear();
+        oled_puts(0U, 0U, "OLED:OK");
+    } else {
+        (void)oled_status;
+    }
     tune.line_active = false;
 
     pid_init(&left_pid, tune.kp, tune.ki, tune.kd, tune.target,
@@ -199,12 +270,28 @@ int main(void)
             }
         }
 
-        if (uart_tune_poll(&tune)) {
+        {
+            bool was_run = tune.run;
+            bool changed = uart_tune_poll(&tune);
+
+            if (changed && !was_run && tune.run) {
+                g_run_time_ms = 0U;
+                g_run_timer_enabled = true;
+                debug_puts("RUN TIME START\r\n");
+            } else if (changed && was_run && !tune.run) {
+                g_run_timer_enabled = false;
+                debug_puts("RUN TIME MS ");
+                debug_print_i32((int32_t)run_time_snapshot_ms());
+                debug_puts("\r\n");
+            }
+
+            if (changed) {
             if (tune.run) {
                 tune.line_active = true;
             }
             pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
             pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
+            }
         }
 
         if (tune.reset_pid) {
@@ -247,6 +334,8 @@ int main(void)
 
             last_control_ms += SPEED_CTRL_PERIOD_MS;
             encoder_get_delta(&left_delta, &right_delta);
+            motion_state_update(&motion, left_delta, right_delta,
+                SPEED_CTRL_PERIOD_MS);
             left_speed = (left_delta < 0) ? (int)(-left_delta) : (int)left_delta;
             right_speed = (right_delta < 0) ? (int)(-right_delta) : (int)right_delta;
 
@@ -310,12 +399,10 @@ int main(void)
             }
         }
 
-        if ((g_ms_ticks - last_report_ms) >= UART_REPORT_PERIOD_MS) {
-            last_report_ms += UART_REPORT_PERIOD_MS;
-            gray_raw = gray_sensor_read_raw();
-            key_raw = key_state_raw();
-            uart_tune_send_status(&tune, left_speed, right_speed,
-                left_pwm, right_pwm, gray_raw, key_raw);
+        if ((g_ms_ticks - last_oled_ms) >= 200U) {
+            last_oled_ms += 200U;
+            oled_show_motion(&motion, g_run_time_ms, tune.run);
         }
+
     }
 }

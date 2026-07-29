@@ -143,7 +143,6 @@ void uart_tune_init(TuneParams *params)
     params->reset_pid = true;
 
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
-    uart_tune_send_help();
 }
 
 void uart_tune_handle_irq(void)
@@ -307,32 +306,6 @@ static void parse_line(TuneParams *params, char *line)
         token = strtok(NULL, " ,;");
     }
 
-    uart_puts("OK P");
-    uart_print_float_3(params->kp);
-    uart_puts(" I");
-    uart_print_float_3(params->ki);
-    uart_puts(" D");
-    uart_print_float_3(params->kd);
-    uart_puts(" T");
-    uart_print_float_3(params->target);
-    uart_puts(" B");
-    uart_print_i32(params->base_pwm);
-    uart_puts(" BL");
-    uart_print_i32(params->left_pwm_trim);
-    uart_puts(" BR");
-    uart_print_i32(params->right_pwm_trim);
-    uart_puts(" BK");
-    uart_print_i32(params->brake_ms);
-    uart_puts(" LINE LP");
-    uart_print_float_3(params->line_kp);
-    uart_puts(" LD");
-    uart_print_float_3(params->line_kd);
-    uart_puts(" LC");
-    uart_print_i32(params->line_corr_limit);
-    uart_puts(" LS");
-    uart_print_i32(params->line_search_pwm);
-    uart_putc(' ');
-    uart_puts(params->run ? "RUN\r\n" : "STOP\r\n");
 }
 
 bool uart_tune_poll(TuneParams *params)
@@ -343,6 +316,15 @@ bool uart_tune_poll(TuneParams *params)
     char ch;
 
     while (rx_pop(&ch)) {
+        char upper = (char)toupper((unsigned char)ch);
+
+        if ((index == 0U) && ((upper == 'R') || (upper == 'S'))) {
+            line[0] = upper;
+            line[1] = '\0';
+            parse_line(params, line);
+            changed = true;
+            continue;
+        }
         if ((ch == '\r') || (ch == '\n')) {
             if (index > 0U) {
                 line[index] = '\0';
@@ -359,7 +341,8 @@ bool uart_tune_poll(TuneParams *params)
 
 void uart_tune_send_status(const TuneParams *params, int left_speed,
                            int right_speed, int left_pwm, int right_pwm,
-                           uint8_t gray_raw, uint8_t key_raw)
+                           uint8_t gray_raw, uint8_t key_raw,
+                           uint32_t run_time_ms)
 {
     static uint32_t timestamp_ms;
     int input = (left_speed + right_speed) / 2;
@@ -412,6 +395,8 @@ void uart_tune_send_status(const TuneParams *params, int left_speed,
     uart_print_i32(params->line_corr_limit);
     uart_putc(',');
     uart_print_i32(params->line_search_pwm);
+    uart_putc(',');
+    uart_print_u32(run_time_ms);
     uart_puts("\r\n");
 }
 
@@ -419,6 +404,6 @@ void uart_tune_send_help(void)
 {
     uart_puts("\r\nCascade line PID ready\r\n");
     uart_puts("UART1 PB6=TX PB7=RX 9600 8N1\r\n");
-    uart_puts("CSV: timestamp,loop,setpoint,input,pwm,error,p,i,d,left_speed,right_speed,left_pwm,right_pwm,gray_raw,key_raw,run_state,line_bits,line_error,line_corr,line_valid,line_p,line_d,line_limit,line_search_pwm\r\n");
+    uart_puts("CSV: timestamp,loop,setpoint,input,pwm,error,p,i,d,left_speed,right_speed,left_pwm,right_pwm,gray_raw,key_raw,run_state,line_bits,line_error,line_corr,line_valid,line_p,line_d,line_limit,line_search_pwm,run_time_ms\r\n");
     uart_puts("Cmd: B15/LINE=start B5/S=stop | T120 B240 P0.25 I0.002 D0 LP1.2 LD3 LC110 LS260 BR-14\r\n");
 }
