@@ -1,0 +1,14 @@
+Debug/
+build_check/
+*.o
+*.d
+*.d_raw
+*.out
+*.map
+*_linkInfo.xml
+device.opt
+device_linker.cmd
+device.cmd.genlibs
+ti_msp_dl_config.c
+ti_msp_dl_config.h
+Event.dot

@@ -1,0 +1,37 @@
+{
+    "configurations": [
+        {
+            "name": "MSPM0G3507_Config",
+            "includePath": [
+                "${workspaceFolder}",
+                "${workspaceFolder}/Debug/syscfg",
+                "C:/ti/mspm0_sdk_2_11_00_07/source",
+                "C:/ti/mspm0_sdk_2_11_00_07/source/third_party/CMSIS/Core/Include",
+                "C:/ti/ti_cgt_arm_llvm_4.0.2.LTS/include/c"
+            ],
+            "defines": [
+                "__MSPM0G3507__",
+                "__USE_SYSCONFIG__"
+            ],
+            "compilerPath": "C:/ti/ti_cgt_arm_llvm_4.0.2.LTS/bin/tiarmclang.exe",
+            "compilerArgs": [
+                "-mcpu=cortex-m0plus",
+                "-march=thumbv6m",
+                "-mthumb",
+                "-mfloat-abi=soft"
+            ],
+            "cStandard": "c99",
+            "cppStandard": "c++11",
+            "intelliSenseMode": "windows-clang-arm",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "${workspaceFolder}/Debug/syscfg",
+                    "C:/ti/mspm0_sdk_2_11_00_07/source"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ],
+    "version": 4
+}
