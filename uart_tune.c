@@ -136,6 +136,12 @@ void uart_tune_init(TuneParams *params)
     params->line_error = 0;
     params->line_correction = 0;
     params->line_bits = 0U;
+    params->a_total_min = A_MARK_DEFAULT_TOTAL;
+    params->a_span_min = A_MARK_DEFAULT_SPAN;
+    params->a_confirm_frames = A_MARK_DEFAULT_FRAMES;
+    params->a_min_lap_ms = A_MARK_MIN_LAP_MS;
+    params->a_min_lap_counts = A_MARK_MIN_LAP_COUNTS;
+    params->a_debug_enable = false;
     params->line_active = false;
     params->line_valid = false;
     params->ball_start_request = false;
@@ -203,6 +209,68 @@ static void apply_token(TuneParams *params, char *token)
         (toupper((unsigned char)token[1]) == 'T')) {
         params->ball_target_mm = parse_token_value(token, 2U);
         params->ball_target_request = true;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'D')) {
+        params->a_debug_enable = (parse_token_value(token, 2U) > 0.0f);
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'T')) {
+        int total = (int)parse_token_value(token, 2U);
+        if (total < 1) {
+            total = 1;
+        }
+        if (total > 8) {
+            total = 8;
+        }
+        params->a_total_min = (uint8_t)total;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'C')) {
+        int span = (int)parse_token_value(token, 2U);
+        if (span < 1) {
+            span = 1;
+        }
+        if (span > 8) {
+            span = 8;
+        }
+        params->a_span_min = (uint8_t)span;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'F')) {
+        int frames = (int)parse_token_value(token, 2U);
+        if (frames < 1) {
+            frames = 1;
+        }
+        if (frames > 20) {
+            frames = 20;
+        }
+        params->a_confirm_frames = (uint8_t)frames;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'M')) {
+        int min_lap_ms = (int)parse_token_value(token, 2U);
+        if (min_lap_ms < 0) {
+            min_lap_ms = 0;
+        }
+        if (min_lap_ms > 30000) {
+            min_lap_ms = 30000;
+        }
+        params->a_min_lap_ms = (uint16_t)min_lap_ms;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'A') &&
+        (toupper((unsigned char)token[1]) == 'N')) {
+        int min_lap_counts = (int)parse_token_value(token, 2U);
+        if (min_lap_counts < 0) {
+            min_lap_counts = 0;
+        }
+        params->a_min_lap_counts = (uint32_t)min_lap_counts;
         return;
     }
     if ((toupper((unsigned char)token[0]) == 'S') &&
@@ -438,7 +506,10 @@ void uart_tune_send_help(void)
     uart_puts("\r\nCascade line PID ready\r\n");
     uart_puts("UART1 PB6=TX PB7=RX 9600 8N1\r\n");
     uart_puts("CSV: timestamp,loop,setpoint,input,pwm,error,p,i,d,left_speed,right_speed,left_pwm,right_pwm,gray_raw,key_raw,run_state,line_bits,line_error,line_corr,line_valid,line_p,line_d,line_limit,line_search_pwm,run_time_ms\r\n");
-    uart_puts("Cmd: B15/LINE=start B5/S=stop | T120 B240 P0.25 I0.002 D0 LP1.2 LD3 LC110 LS260 BR-14\r\n");
+    uart_puts("Cmd: K4/LINE=start lap | K1=next mode | S=stop\r\n");
+    uart_puts("Tune: T190 B400 P1.2 I0.003 D0 LP3.8 LD2.4 LC460 BR-14\r\n");
+    uart_puts("A mark: AT3=total AC3=span AF2=frames AM5000=ms AN9000=counts AD1/AD0=debug\r\n");
+    uart_puts("ADBG: T,PH,BITS,TOT,SPAN,AF,ODOM,BASE,AT,AC,ERR,COR\r\n");
     uart_puts("Ball: Z=mark neutral | Q3=start +/-5cm sequence | Q0/S=stop | BT50=set ball target mm\r\n");
     uart_puts("Stepper cal: SH=mark right-high limit | SL=mark right-low limit | SP=print stepper state\r\n");
 }

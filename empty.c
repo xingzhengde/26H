@@ -25,6 +25,13 @@ typedef enum {
     APP_MODE_COUNT
 } AppMode;
 
+typedef enum {
+    LINE_LAP_IDLE = 0,
+    LINE_LAP_WAIT_START_A,
+    LINE_LAP_RUNNING,
+    LINE_LAP_FINISHED
+} LineLapPhase;
+
 typedef struct {
     float kp;
     float ki;
@@ -38,6 +45,11 @@ typedef struct {
     float line_kd;
     int16_t line_corr_limit;
     int16_t line_search_pwm;
+    uint8_t a_total_min;
+    uint8_t a_span_min;
+    uint8_t a_confirm_frames;
+    uint16_t a_min_lap_ms;
+    uint32_t a_min_lap_counts;
 } LineModeParams;
 
 typedef struct {
@@ -45,6 +57,14 @@ typedef struct {
     float jog_speed_dps;
     uint32_t jog_interval_ms;
 } StepperModeParams;
+
+typedef struct {
+    uint8_t total_count;
+    uint8_t center_count;
+    uint8_t span;
+    bool candidate;
+    bool finish_candidate;
+} AMarkStats;
 
 static const LineModeParams g_line_mode_params = {
     DEFAULT_KP,
@@ -58,7 +78,12 @@ static const LineModeParams g_line_mode_params = {
     LINE_DEFAULT_KP,
     LINE_DEFAULT_KD,
     LINE_CORR_LIMIT,
-    LINE_SEARCH_PWM
+    LINE_SEARCH_PWM,
+    A_MARK_DEFAULT_TOTAL,
+    A_MARK_DEFAULT_SPAN,
+    A_MARK_DEFAULT_FRAMES,
+    A_MARK_MIN_LAP_MS,
+    A_MARK_MIN_LAP_COUNTS
 };
 
 static const StepperModeParams g_stepper_mode_params = {
@@ -99,6 +124,14 @@ static void debug_print_i32(int32_t value)
     while (index > 0U) {
         debug_putc(digits[--index]);
     }
+}
+
+static void debug_print_u8_hex(uint8_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    debug_putc(hex[(value >> 4) & 0x0F]);
+    debug_putc(hex[value & 0x0F]);
 }
 
 static void debug_print_stepper_state(const char *tag)
@@ -169,6 +202,17 @@ static float clamp_f32(float value, float min_value, float max_value)
     return value;
 }
 
+static uint8_t count_bits_u8(uint8_t value)
+{
+    uint8_t count = 0U;
+
+    while (value != 0U) {
+        count = (uint8_t)(count + (value & 1U));
+        value >>= 1U;
+    }
+    return count;
+}
+
 static bool b5_pressed(void)
 {
     return (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_5) == 0U);
@@ -215,6 +259,12 @@ static void apply_line_mode_params(TuneParams *tune)
     tune->line_kd = g_line_mode_params.line_kd;
     tune->line_corr_limit = g_line_mode_params.line_corr_limit;
     tune->line_search_pwm = g_line_mode_params.line_search_pwm;
+    tune->a_total_min = g_line_mode_params.a_total_min;
+    tune->a_span_min = g_line_mode_params.a_span_min;
+    tune->a_confirm_frames = g_line_mode_params.a_confirm_frames;
+    tune->a_min_lap_ms = g_line_mode_params.a_min_lap_ms;
+    tune->a_min_lap_counts = g_line_mode_params.a_min_lap_counts;
+    tune->a_debug_enable = false;
     tune->reset_pid = true;
 }
 
@@ -340,6 +390,15 @@ static void clear_line_timer(void)
     debug_puts("RUN TIME CLEAR\r\n");
 }
 
+static void line_lap_reset(LineLapPhase *phase, uint8_t *confirm_frames,
+                           uint8_t *release_frames, bool *released_start)
+{
+    *phase = LINE_LAP_IDLE;
+    *confirm_frames = 0U;
+    *release_frames = 0U;
+    *released_start = false;
+}
+
 static void debug_print_keys(const char *tag, const TuneParams *tune)
 {
     debug_puts(tag);
@@ -357,6 +416,105 @@ static void debug_print_mode(const char *tag, AppMode mode)
     debug_puts(tag);
     debug_puts(" MODE=");
     debug_puts(app_mode_name(mode));
+    debug_puts("\r\n");
+}
+
+static AMarkStats line_a_mark_update(uint8_t gray_bits,
+                                     const TuneParams *tune)
+{
+    AMarkStats stats;
+    int8_t first = -1;
+    int8_t last = -1;
+    uint8_t i;
+
+    stats.total_count = count_bits_u8(gray_bits);
+    stats.center_count = 0U;
+    for (i = 0U; i < 8U; i++) {
+        if ((gray_bits & (uint8_t)(1U << i)) != 0U) {
+            if (first < 0) {
+                first = (int8_t)i;
+            }
+            last = (int8_t)i;
+        }
+    }
+    stats.span = (first < 0) ? 0U : (uint8_t)(last - first + 1);
+    stats.candidate = (stats.total_count >= tune->a_total_min) &&
+        (stats.span >= tune->a_span_min);
+    stats.finish_candidate =
+        (stats.total_count >= A_MARK_FINISH_TOTAL) &&
+        (stats.span >= A_MARK_FINISH_SPAN);
+    return stats;
+}
+
+static void debug_print_a_status(LineLapPhase phase, uint32_t run_time_ms,
+                                 uint8_t gray_bits,
+                                 const AMarkStats *stats,
+                                 uint8_t confirm_frames,
+                                 const TuneParams *tune,
+                                 uint32_t lap_counts,
+                                 uint8_t baseline_total,
+                                 uint8_t baseline_span)
+{
+    debug_puts("ADBG,T=");
+    debug_print_i32((int32_t)run_time_ms);
+    debug_puts(",PH=");
+    debug_print_i32((int32_t)phase);
+    debug_puts(",BITS=0x");
+    debug_print_u8_hex(gray_bits);
+    debug_puts(",TOT=");
+    debug_print_i32((int32_t)stats->total_count);
+    debug_puts(",SPAN=");
+    debug_print_i32((int32_t)stats->span);
+    debug_puts(",AF=");
+    debug_print_i32((int32_t)confirm_frames);
+    debug_puts(",ODOM=");
+    debug_print_i32((int32_t)lap_counts);
+    debug_puts(",BASE=");
+    debug_print_i32((int32_t)baseline_total);
+    debug_putc('/');
+    debug_print_i32((int32_t)baseline_span);
+    debug_puts(",AT=");
+    debug_print_i32((int32_t)tune->a_total_min);
+    debug_puts(",AC=");
+    debug_print_i32((int32_t)tune->a_span_min);
+    debug_puts(",ERR=");
+    debug_print_i32((int32_t)tune->line_error);
+    debug_puts(",COR=");
+    debug_print_i32((int32_t)tune->line_correction);
+    debug_puts("\r\n");
+}
+
+static void debug_print_a_gate(const char *tag, uint32_t run_time_ms,
+                               uint8_t gray_bits,
+                               const AMarkStats *stats,
+                               uint32_t lap_counts,
+                               uint8_t baseline_total,
+                               uint8_t baseline_span,
+                               bool enough_time,
+                               bool enough_odom,
+                               bool width_jump)
+{
+    debug_puts(tag);
+    debug_puts(",T=");
+    debug_print_i32((int32_t)run_time_ms);
+    debug_puts(",BITS=0x");
+    debug_print_u8_hex(gray_bits);
+    debug_puts(",TOT=");
+    debug_print_i32((int32_t)stats->total_count);
+    debug_puts(",SPAN=");
+    debug_print_i32((int32_t)stats->span);
+    debug_puts(",ODOM=");
+    debug_print_i32((int32_t)lap_counts);
+    debug_puts(",BASE=");
+    debug_print_i32((int32_t)baseline_total);
+    debug_putc('/');
+    debug_print_i32((int32_t)baseline_span);
+    debug_puts(",TIME=");
+    debug_print_i32(enough_time ? 1 : 0);
+    debug_puts(",DIST=");
+    debug_print_i32(enough_odom ? 1 : 0);
+    debug_puts(",JUMP=");
+    debug_print_i32(width_jump ? 1 : 0);
     debug_puts("\r\n");
 }
 
@@ -404,12 +562,23 @@ int main(void)
 #if OLED_RUNTIME_ENABLE
     uint32_t last_oled_ms = 0;
 #endif
+#if CONTROL_LAG_DEBUG_ENABLE
     uint32_t last_lag_report_ms = 0;
+#endif
     uint32_t last_boot_key_report_ms = 0;
     uint32_t brake_until_ms = 0;
     AppMode app_mode = APP_MODE_LINE_TIMER;
     bool mode_started = false;
     bool line_paused = false;
+    LineLapPhase line_lap_phase = LINE_LAP_IDLE;
+    uint8_t a_confirm_frames = 0U;
+    uint8_t a_release_frames = 0U;
+    bool a_released_start = false;
+    uint32_t line_lap_counts = 0U;
+    uint8_t a_baseline_total = 1U;
+    uint8_t a_baseline_span = 1U;
+    uint32_t last_a_debug_ms = 0U;
+    uint32_t last_a_gate_debug_ms = 0U;
     MotionState motion;
     K230BallSample ball_sample;
     int left_speed = 0;
@@ -418,6 +587,7 @@ int main(void)
     int16_t right_pwm = 0;
     uint8_t gray_raw = 0U;
     int oled_status;
+    bool oled_ready = false;
 
     SYSCFG_DL_init();
     motor_init();
@@ -439,13 +609,16 @@ int main(void)
 #if OLED_RUNTIME_ENABLE
     oled_status = oled_init();
     if (oled_status >= 0) {
+        oled_ready = true;
         oled_clear();
         oled_puts(0U, 0U, "OLED:OK");
     } else {
-        (void)oled_status;
+        oled_ready = false;
+        debug_puts("OLED INIT FAIL\r\n");
     }
 #else
     (void)oled_status;
+    (void)oled_ready;
 #endif
     tune.line_active = false;
 
@@ -497,12 +670,24 @@ int main(void)
                 debug_puts("UART RUN IGNORED IN NON LINE MODE\r\n");
             } else if (changed && !was_run && tune.run) {
                 mode_started = true;
+                line_lap_phase = LINE_LAP_RUNNING;
+                a_confirm_frames = 0U;
+                a_release_frames = 0U;
+                a_released_start = false;
+                line_lap_counts = 0U;
+                a_baseline_total = 1U;
+                a_baseline_span = 1U;
                 g_run_time_ms = 0U;
                 g_run_timer_enabled = true;
                 debug_puts("RUN TIME START\r\n");
             } else if (changed && was_run && !tune.run) {
                 mode_started = false;
                 line_paused = false;
+                line_lap_reset(&line_lap_phase, &a_confirm_frames,
+                    &a_release_frames, &a_released_start);
+                line_lap_counts = 0U;
+                a_baseline_total = 1U;
+                a_baseline_span = 1U;
                 g_run_timer_enabled = false;
                 debug_puts("RUN TIME MS ");
                 debug_print_i32((int32_t)run_time_snapshot_ms());
@@ -586,6 +771,11 @@ int main(void)
             stepper_arm_stop();
             mode_started = false;
             line_paused = false;
+            line_lap_reset(&line_lap_phase, &a_confirm_frames,
+                &a_release_frames, &a_released_start);
+            line_lap_counts = 0U;
+            a_baseline_total = 1U;
+            a_baseline_span = 1U;
             app_mode = (AppMode)(((uint8_t)app_mode + 1U) %
                 (uint8_t)APP_MODE_COUNT);
             if (app_mode == APP_MODE_LINE_TIMER) {
@@ -607,6 +797,13 @@ int main(void)
                         resume_line_tracking(&tune);
                     } else {
                         debug_puts("MODE LINE START\r\n");
+                        line_lap_phase = LINE_LAP_RUNNING;
+                        a_confirm_frames = 0U;
+                        a_release_frames = 0U;
+                        a_released_start = false;
+                        line_lap_counts = 0U;
+                        a_baseline_total = 1U;
+                        a_baseline_span = 1U;
                         start_line_tracking(&tune);
                     }
                 } else {
@@ -624,6 +821,14 @@ int main(void)
         if (app_mode == APP_MODE_LINE_TIMER) {
             if (b11_press_event()) {
                 clear_line_timer();
+                line_lap_phase = tune.run ? LINE_LAP_WAIT_START_A :
+                    LINE_LAP_IDLE;
+                a_confirm_frames = 0U;
+                a_release_frames = 0U;
+                a_released_start = false;
+                line_lap_counts = 0U;
+                a_baseline_total = 1U;
+                a_baseline_span = 1U;
             }
             if (b14_press_event() && tune.run) {
                 line_paused = true;
@@ -652,12 +857,14 @@ int main(void)
 
             if (control_elapsed_ms > CONTROL_LAG_WARN_MS) {
                 last_control_ms = g_ms_ticks;
+#if CONTROL_LAG_DEBUG_ENABLE
                 if ((g_ms_ticks - last_lag_report_ms) >= 1000U) {
                     last_lag_report_ms = g_ms_ticks;
                     debug_puts("CTRL LAG MS ");
                     debug_print_i32((int32_t)control_elapsed_ms);
                     debug_puts("\r\n");
                 }
+#endif
             } else {
                 last_control_ms += SPEED_CTRL_PERIOD_MS;
             }
@@ -666,10 +873,20 @@ int main(void)
                 SPEED_CTRL_PERIOD_MS);
             left_speed = (left_delta < 0) ? (int)(-left_delta) : (int)left_delta;
             right_speed = (right_delta < 0) ? (int)(-right_delta) : (int)right_delta;
+            if ((app_mode == APP_MODE_LINE_TIMER) &&
+                (line_lap_phase == LINE_LAP_RUNNING)) {
+                uint32_t left_abs = (left_delta < 0) ?
+                    (uint32_t)(-left_delta) : (uint32_t)left_delta;
+                uint32_t right_abs = (right_delta < 0) ?
+                    (uint32_t)(-right_delta) : (uint32_t)right_delta;
+
+                line_lap_counts += (left_abs + right_abs) / 2U;
+            }
 
             if (tune.line_active) {
                 float left_target;
                 float right_target;
+                float base_target;
                 int16_t speed_delta;
 
                 gray_raw = gray_sensor_read_raw();
@@ -680,12 +897,139 @@ int main(void)
                 tune.line_correction = speed_delta;
                 tune.line_valid = tracker.valid;
 
-                left_target = clamp_f32(tune.target + (float)speed_delta,
+                base_target = tune.target;
+                if (tracker.valid &&
+                    ((tracker.error >= LINE_CURVE_ERR_START) ||
+                     (tracker.error <= -LINE_CURVE_ERR_START))) {
+                    base_target -= LINE_CURVE_TARGET_DROP;
+                    if (base_target < LINE_MIN_WHEEL_TARGET) {
+                        base_target = LINE_MIN_WHEEL_TARGET;
+                    }
+                }
+
+                left_target = clamp_f32(base_target + (float)speed_delta,
                     LINE_MIN_WHEEL_TARGET, tune.target + LINE_CORR_LIMIT);
-                right_target = clamp_f32(tune.target - (float)speed_delta,
+                right_target = clamp_f32(base_target - (float)speed_delta,
                     LINE_MIN_WHEEL_TARGET, tune.target + LINE_CORR_LIMIT);
                 pid_set_target(&left_pid, left_target);
                 pid_set_target(&right_pid, right_target);
+
+                if ((app_mode == APP_MODE_LINE_TIMER) &&
+                    (line_lap_phase != LINE_LAP_IDLE) &&
+                    (line_lap_phase != LINE_LAP_FINISHED)) {
+                    AMarkStats a_stats = line_a_mark_update(gray_raw, &tune);
+
+                    bool enough_odom =
+                        line_lap_counts >= tune.a_min_lap_counts;
+                    bool enough_time =
+                        g_run_time_ms >= tune.a_min_lap_ms;
+                    bool width_jump =
+                        (a_stats.total_count >=
+                         (uint8_t)(a_baseline_total + A_MARK_JUMP_TOTAL)) ||
+                        (a_stats.span >=
+                         (uint8_t)(a_baseline_span + A_MARK_JUMP_SPAN));
+                    bool finish_hit = a_stats.finish_candidate &&
+                        enough_time && enough_odom && width_jump;
+
+                    if (tune.a_debug_enable && a_released_start &&
+                        a_stats.finish_candidate &&
+                        ((g_ms_ticks - last_a_gate_debug_ms) >= 500U)) {
+                        last_a_gate_debug_ms = g_ms_ticks;
+                        debug_print_a_gate(finish_hit ? "AHIT" : "AREJ",
+                            run_time_snapshot_ms(), gray_raw, &a_stats,
+                            line_lap_counts, a_baseline_total,
+                            a_baseline_span, enough_time, enough_odom,
+                            width_jump);
+                    }
+
+                    if ((line_lap_phase == LINE_LAP_RUNNING) &&
+                        a_released_start && !finish_hit &&
+                        (!enough_time || !enough_odom ||
+                         !a_stats.finish_candidate)) {
+                        a_baseline_total = (uint8_t)
+                            (((uint16_t)a_baseline_total *
+                              (A_MARK_BASELINE_ALPHA - 1U) +
+                              a_stats.total_count) /
+                             A_MARK_BASELINE_ALPHA);
+                        a_baseline_span = (uint8_t)
+                            (((uint16_t)a_baseline_span *
+                              (A_MARK_BASELINE_ALPHA - 1U) +
+                              a_stats.span) /
+                             A_MARK_BASELINE_ALPHA);
+                    }
+
+                    if (line_lap_phase == LINE_LAP_WAIT_START_A &&
+                        a_stats.candidate) {
+                        if (a_confirm_frames < 255U) {
+                            a_confirm_frames++;
+                        }
+                    } else if (line_lap_phase == LINE_LAP_RUNNING &&
+                        a_released_start && finish_hit) {
+                        if (a_confirm_frames < 255U) {
+                            a_confirm_frames++;
+                        }
+                    } else if (line_lap_phase == LINE_LAP_RUNNING) {
+                        a_confirm_frames = 0U;
+                    } else {
+                        a_confirm_frames = 0U;
+                    }
+
+                    if (line_lap_phase == LINE_LAP_RUNNING) {
+                        bool a_like = a_stats.candidate ||
+                            a_stats.finish_candidate;
+
+                        if (a_like) {
+                            a_release_frames = 0U;
+                        } else if (a_release_frames < 255U) {
+                            a_release_frames++;
+                        }
+                    }
+
+                    if (line_lap_phase == LINE_LAP_WAIT_START_A) {
+                        if (a_confirm_frames >= tune.a_confirm_frames) {
+                            __disable_irq();
+                            g_run_time_ms = 0U;
+                            __enable_irq();
+                            g_run_timer_enabled = true;
+                            line_lap_phase = LINE_LAP_RUNNING;
+                            a_confirm_frames = 0U;
+                            a_release_frames = 0U;
+                            a_released_start = false;
+                            line_lap_counts = 0U;
+                            a_baseline_total = 1U;
+                            a_baseline_span = 1U;
+                            debug_puts("A START\r\n");
+                        }
+                    } else if (line_lap_phase == LINE_LAP_RUNNING) {
+                        if (!a_released_start &&
+                            (a_release_frames >= A_MARK_RELEASE_FRAMES)) {
+                            a_released_start = true;
+                            debug_puts("A LEAVE\r\n");
+                        }
+                        if (a_released_start && finish_hit &&
+                            (a_confirm_frames >= tune.a_confirm_frames)) {
+                            tune.run = false;
+                            tune.line_active = false;
+                            tune.brake_request = true;
+                            g_run_timer_enabled = false;
+                            line_lap_phase = LINE_LAP_FINISHED;
+                            mode_started = true;
+                            debug_puts("A FINISH TIME ");
+                            debug_print_i32((int32_t)run_time_snapshot_ms());
+                            debug_puts("\r\n");
+                        }
+                    }
+
+                    if (tune.a_debug_enable &&
+                        ((g_ms_ticks - last_a_debug_ms) >=
+                        A_MARK_DEBUG_PERIOD_MS)) {
+                        last_a_debug_ms = g_ms_ticks;
+                        debug_print_a_status(line_lap_phase,
+                            run_time_snapshot_ms(), gray_raw, &a_stats,
+                            a_confirm_frames, &tune, line_lap_counts,
+                            a_baseline_total, a_baseline_span);
+                    }
+                }
             } else {
                 pid_set_target(&left_pid, tune.target);
                 pid_set_target(&right_pid, tune.target);
@@ -735,8 +1079,10 @@ int main(void)
         }
 
 #if OLED_RUNTIME_ENABLE
-        if ((g_ms_ticks - last_oled_ms) >= 200U) {
-            last_oled_ms += 200U;
+        if (oled_ready && (!tune.run || !tune.line_active ||
+            (line_lap_phase == LINE_LAP_FINISHED)) &&
+            ((g_ms_ticks - last_oled_ms) >= 500U)) {
+            last_oled_ms = g_ms_ticks;
             if (app_mode == APP_MODE_LINE_TIMER) {
                 oled_show_line_mode(g_run_time_ms, mode_started, tune.run,
                     line_paused);

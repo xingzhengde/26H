@@ -373,7 +373,7 @@ static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
     }
     oled_make_time_text(line, run_time_ms);
     oled_puts_fixed(4U, 0U, line, 21U);
-    oled_puts_fixed(6U, 0U, "K4 GO B14 PAUSE", 21U);
+    oled_puts_fixed(6U, 0U, "B11 CLR B14 PAUSE", 21U);
 }
 
 static inline void oled_show_stepper_mode(const StepperArmState *state,

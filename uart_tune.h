@@ -20,6 +20,12 @@ typedef struct {
     int16_t line_error;
     int16_t line_correction;
     uint8_t line_bits;
+    uint8_t a_total_min;
+    uint8_t a_span_min;
+    uint8_t a_confirm_frames;
+    uint16_t a_min_lap_ms;
+    uint32_t a_min_lap_counts;
+    bool a_debug_enable;
     bool line_active;
     bool line_valid;
     bool ball_start_request;
