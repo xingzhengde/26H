@@ -22,6 +22,14 @@ typedef struct {
     uint8_t line_bits;
     bool line_active;
     bool line_valid;
+    bool ball_start_request;
+    bool ball_stop_request;
+    bool ball_zero_request;
+    bool stepper_mark_high_request;
+    bool stepper_mark_low_request;
+    bool stepper_print_request;
+    bool ball_target_request;
+    float ball_target_mm;
     bool brake_request;
     bool run;
     bool reset_pid;

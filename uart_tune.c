@@ -138,6 +138,14 @@ void uart_tune_init(TuneParams *params)
     params->line_bits = 0U;
     params->line_active = false;
     params->line_valid = false;
+    params->ball_start_request = false;
+    params->ball_stop_request = false;
+    params->ball_zero_request = false;
+    params->stepper_mark_high_request = false;
+    params->stepper_mark_low_request = false;
+    params->stepper_print_request = false;
+    params->ball_target_request = false;
+    params->ball_target_mm = 0.0f;
     params->brake_request = false;
     params->run = false;
     params->reset_pid = true;
@@ -189,6 +197,27 @@ static void apply_token(TuneParams *params, char *token)
 
     token = skip_space(token);
     if (*token == '\0') {
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'B') &&
+        (toupper((unsigned char)token[1]) == 'T')) {
+        params->ball_target_mm = parse_token_value(token, 2U);
+        params->ball_target_request = true;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'S') &&
+        (toupper((unsigned char)token[1]) == 'H')) {
+        params->stepper_mark_high_request = true;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'S') &&
+        (toupper((unsigned char)token[1]) == 'L')) {
+        params->stepper_mark_low_request = true;
+        return;
+    }
+    if ((toupper((unsigned char)token[0]) == 'S') &&
+        (toupper((unsigned char)token[1]) == 'P')) {
+        params->stepper_print_request = true;
         return;
     }
     if ((toupper((unsigned char)token[0]) == 'B') &&
@@ -285,12 +314,25 @@ static void apply_token(TuneParams *params, char *token)
     case 'S':
         params->run = false;
         params->line_active = false;
+        params->ball_stop_request = true;
         params->brake_request = true;
         params->reset_pid = true;
         break;
+    case 'Q':
+        if ((token[1] == '3') || (toupper((unsigned char)token[1]) == 'S')) {
+            params->ball_start_request = true;
+        } else {
+            params->ball_stop_request = true;
+        }
+        break;
+    case 'Z':
+        params->ball_zero_request = true;
+        break;
     case 'H':
     case '?':
-        uart_tune_send_help();
+        if (token[1] == '\0') {
+            uart_tune_send_help();
+        }
         break;
     default:
         break;
@@ -316,15 +358,6 @@ bool uart_tune_poll(TuneParams *params)
     char ch;
 
     while (rx_pop(&ch)) {
-        char upper = (char)toupper((unsigned char)ch);
-
-        if ((index == 0U) && ((upper == 'R') || (upper == 'S'))) {
-            line[0] = upper;
-            line[1] = '\0';
-            parse_line(params, line);
-            changed = true;
-            continue;
-        }
         if ((ch == '\r') || (ch == '\n')) {
             if (index > 0U) {
                 line[index] = '\0';
@@ -406,4 +439,6 @@ void uart_tune_send_help(void)
     uart_puts("UART1 PB6=TX PB7=RX 9600 8N1\r\n");
     uart_puts("CSV: timestamp,loop,setpoint,input,pwm,error,p,i,d,left_speed,right_speed,left_pwm,right_pwm,gray_raw,key_raw,run_state,line_bits,line_error,line_corr,line_valid,line_p,line_d,line_limit,line_search_pwm,run_time_ms\r\n");
     uart_puts("Cmd: B15/LINE=start B5/S=stop | T120 B240 P0.25 I0.002 D0 LP1.2 LD3 LC110 LS260 BR-14\r\n");
+    uart_puts("Ball: Z=mark neutral | Q3=start +/-5cm sequence | Q0/S=stop | BT50=set ball target mm\r\n");
+    uart_puts("Stepper cal: SH=mark right-high limit | SL=mark right-low limit | SP=print stepper state\r\n");
 }

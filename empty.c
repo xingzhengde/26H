@@ -1,11 +1,14 @@
 #include "app_config.h"
+#include "ball_balance.h"
 #include "encoder.h"
 #include "gray_sensor.h"
+#include "k230_ball.h"
 #include "line_tracker.h"
 #include "motion_state.h"
 #include "motor.h"
 #include "oled.h"
 #include "pid.h"
+#include "stepper_arm.h"
 #include "ti_msp_dl_config.h"
 #include "uart_tune.h"
 #include <stdbool.h>
@@ -15,6 +18,54 @@ static volatile uint32_t g_ms_ticks;
 static volatile uint32_t g_run_time_ms;
 static volatile bool g_run_timer_enabled;
 static bool g_buttons_released_after_boot;
+
+typedef enum {
+    APP_MODE_LINE_TIMER = 0,
+    APP_MODE_STEPPER_MANUAL,
+    APP_MODE_COUNT
+} AppMode;
+
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float target;
+    int base_pwm;
+    int left_pwm_trim;
+    int right_pwm_trim;
+    uint16_t brake_ms;
+    float line_kp;
+    float line_kd;
+    int16_t line_corr_limit;
+    int16_t line_search_pwm;
+} LineModeParams;
+
+typedef struct {
+    int32_t jog_steps;
+    float jog_speed_dps;
+    uint32_t jog_interval_ms;
+} StepperModeParams;
+
+static const LineModeParams g_line_mode_params = {
+    DEFAULT_KP,
+    DEFAULT_KI,
+    DEFAULT_KD,
+    LINE_DEFAULT_TARGET,
+    LINE_DEFAULT_BASE_PWM,
+    DEFAULT_LEFT_PWM_TRIM,
+    DEFAULT_RIGHT_PWM_TRIM,
+    DEFAULT_BRAKE_MS,
+    LINE_DEFAULT_KP,
+    LINE_DEFAULT_KD,
+    LINE_CORR_LIMIT,
+    LINE_SEARCH_PWM
+};
+
+static const StepperModeParams g_stepper_mode_params = {
+    STEPPER_JOG_STEPS,
+    STEPPER_DEFAULT_DPS,
+    STEPPER_JOG_INTERVAL_MS
+};
 
 static void debug_putc(char ch)
 {
@@ -48,6 +99,24 @@ static void debug_print_i32(int32_t value)
     while (index > 0U) {
         debug_putc(digits[--index]);
     }
+}
+
+static void debug_print_stepper_state(const char *tag)
+{
+    StepperArmState state = stepper_arm_get_state();
+
+    debug_puts(tag);
+    debug_puts(" CUR=");
+    debug_print_i32(state.current_steps);
+    debug_puts(" HIGH=");
+    debug_print_i32(state.min_steps);
+    debug_puts(" NEU=");
+    debug_print_i32(state.neutral_steps);
+    debug_puts(" LOW=");
+    debug_print_i32(state.max_steps);
+    debug_puts(" BUSY=");
+    debug_print_i32(state.busy ? 1 : 0);
+    debug_puts("\r\n");
 }
 
 static uint32_t run_time_snapshot_ms(void)
@@ -110,6 +179,61 @@ static bool b15_pressed(void)
     return (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_15) == 0U);
 }
 
+static bool b11_pressed(void)
+{
+    return (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_11) == 0U);
+}
+
+static bool b14_pressed(void)
+{
+    return (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_14) == 0U);
+}
+
+static const char *app_mode_name(AppMode mode)
+{
+    switch (mode) {
+    case APP_MODE_LINE_TIMER:
+        return "LINE";
+    case APP_MODE_STEPPER_MANUAL:
+        return "STEPPER";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void apply_line_mode_params(TuneParams *tune)
+{
+    tune->kp = g_line_mode_params.kp;
+    tune->ki = g_line_mode_params.ki;
+    tune->kd = g_line_mode_params.kd;
+    tune->target = g_line_mode_params.target;
+    tune->base_pwm = g_line_mode_params.base_pwm;
+    tune->left_pwm_trim = g_line_mode_params.left_pwm_trim;
+    tune->right_pwm_trim = g_line_mode_params.right_pwm_trim;
+    tune->brake_ms = g_line_mode_params.brake_ms;
+    tune->line_kp = g_line_mode_params.line_kp;
+    tune->line_kd = g_line_mode_params.line_kd;
+    tune->line_corr_limit = g_line_mode_params.line_corr_limit;
+    tune->line_search_pwm = g_line_mode_params.line_search_pwm;
+    tune->reset_pid = true;
+}
+
+static void stepper_jog_buttons_service(const StepperModeParams *params)
+{
+    static uint32_t last_jog_ms;
+
+    if ((g_ms_ticks - last_jog_ms) < params->jog_interval_ms) {
+        return;
+    }
+    if (b11_pressed() && !b14_pressed()) {
+        last_jog_ms = g_ms_ticks;
+        stepper_arm_jog_steps(params->jog_steps, params->jog_speed_dps);
+    } else if (b14_pressed() && !b11_pressed()) {
+        last_jog_ms = g_ms_ticks;
+        stepper_arm_jog_steps(-params->jog_steps, params->jog_speed_dps);
+    }
+}
+
 static bool button_latched_event(bool pressed, bool *wait_release,
                                  uint32_t *rearm_until_ms)
 {
@@ -149,20 +273,33 @@ static bool b15_press_event(void)
     return button_latched_event(b15_pressed(), &wait_release, &rearm_until_ms);
 }
 
+static bool b11_press_event(void)
+{
+    static bool wait_release;
+    static uint32_t rearm_until_ms;
+
+    return button_latched_event(b11_pressed(), &wait_release, &rearm_until_ms);
+}
+
+static bool b14_press_event(void)
+{
+    static bool wait_release;
+    static uint32_t rearm_until_ms;
+
+    return button_latched_event(b14_pressed(), &wait_release, &rearm_until_ms);
+}
+
 static bool buttons_released(void)
 {
     return !b5_pressed() && !b15_pressed();
 }
 
-static void stop_car(TuneParams *tune)
+static void stop_line_outputs(TuneParams *tune)
 {
     tune->run = false;
     tune->line_active = false;
     tune->brake_request = true;
     g_run_timer_enabled = false;
-    debug_puts("RUN TIME MS ");
-    debug_print_i32((int32_t)run_time_snapshot_ms());
-    debug_puts("\r\n");
 }
 
 static void start_line_tracking(TuneParams *tune)
@@ -175,15 +312,51 @@ static void start_line_tracking(TuneParams *tune)
     debug_puts("RUN TIME START\r\n");
 }
 
+static void resume_line_tracking(TuneParams *tune)
+{
+    tune->run = true;
+    tune->line_active = true;
+    tune->reset_pid = true;
+    g_run_timer_enabled = true;
+    debug_puts("RUN TIME RESUME\r\n");
+}
+
+static void pause_line_tracking(TuneParams *tune)
+{
+    tune->run = false;
+    tune->line_active = false;
+    tune->brake_request = true;
+    g_run_timer_enabled = false;
+    debug_puts("RUN TIME PAUSE ");
+    debug_print_i32((int32_t)run_time_snapshot_ms());
+    debug_puts("\r\n");
+}
+
+static void clear_line_timer(void)
+{
+    __disable_irq();
+    g_run_time_ms = 0U;
+    __enable_irq();
+    debug_puts("RUN TIME CLEAR\r\n");
+}
+
 static void debug_print_keys(const char *tag, const TuneParams *tune)
 {
     debug_puts(tag);
-    debug_puts(" B5=");
+    debug_puts(" K1=");
     debug_print_i32(b5_pressed() ? 1 : 0);
-    debug_puts(" B15=");
+    debug_puts(" K4=");
     debug_print_i32(b15_pressed() ? 1 : 0);
     debug_puts(" RUN=");
     debug_print_i32(tune->run ? 1 : 0);
+    debug_puts("\r\n");
+}
+
+static void debug_print_mode(const char *tag, AppMode mode)
+{
+    debug_puts(tag);
+    debug_puts(" MODE=");
+    debug_puts(app_mode_name(mode));
     debug_puts("\r\n");
 }
 
@@ -211,6 +384,16 @@ void UART_0_INST_IRQHandler(void)
     uart_tune_handle_irq();
 }
 
+void UART_2_INST_IRQHandler(void)
+{
+    k230_ball_handle_irq(g_ms_ticks);
+}
+
+void STEPPER_PWM_INST_IRQHandler(void)
+{
+    stepper_arm_handle_irq();
+}
+
 int main(void)
 {
     TuneParams tune;
@@ -224,7 +407,11 @@ int main(void)
     uint32_t last_lag_report_ms = 0;
     uint32_t last_boot_key_report_ms = 0;
     uint32_t brake_until_ms = 0;
+    AppMode app_mode = APP_MODE_LINE_TIMER;
+    bool mode_started = false;
+    bool line_paused = false;
     MotionState motion;
+    K230BallSample ball_sample;
     int left_speed = 0;
     int right_speed = 0;
     int16_t left_pwm = 0;
@@ -234,6 +421,9 @@ int main(void)
 
     SYSCFG_DL_init();
     motor_init();
+    stepper_arm_init();
+    k230_ball_init();
+    ball_balance_init();
     NVIC_EnableIRQ(RUN_TIMER_INST_INT_IRQN);
     __enable_irq();
     while (g_ms_ticks < 200U) {
@@ -244,6 +434,7 @@ int main(void)
     motion_state_init(&motion);
     line_tracker_init(&tracker);
     uart_tune_init(&tune);
+    apply_line_mode_params(&tune);
     uart_tune_clear_rx();
 #if OLED_RUNTIME_ENABLE
     oled_status = oled_init();
@@ -299,11 +490,19 @@ int main(void)
             bool was_run = tune.run;
             bool changed = uart_tune_poll(&tune);
 
-            if (changed && !was_run && tune.run) {
+            if ((app_mode != APP_MODE_LINE_TIMER) && tune.run) {
+                tune.run = false;
+                tune.line_active = false;
+                tune.brake_request = true;
+                debug_puts("UART RUN IGNORED IN NON LINE MODE\r\n");
+            } else if (changed && !was_run && tune.run) {
+                mode_started = true;
                 g_run_time_ms = 0U;
                 g_run_timer_enabled = true;
                 debug_puts("RUN TIME START\r\n");
             } else if (changed && was_run && !tune.run) {
+                mode_started = false;
+                line_paused = false;
                 g_run_timer_enabled = false;
                 debug_puts("RUN TIME MS ");
                 debug_print_i32((int32_t)run_time_snapshot_ms());
@@ -311,12 +510,61 @@ int main(void)
             }
 
             if (changed) {
-            if (tune.run) {
-                tune.line_active = true;
+                if (tune.run && (app_mode == APP_MODE_LINE_TIMER)) {
+                    tune.line_active = true;
+                }
+                pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
+                pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
             }
-            pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
-            pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
-            }
+        }
+
+        if (tune.ball_zero_request) {
+            stepper_arm_mark_neutral();
+            tune.ball_zero_request = false;
+            debug_print_stepper_state("STEPPER NEUTRAL MARKED");
+        }
+
+        if (tune.stepper_mark_high_request) {
+            stepper_arm_mark_high_limit();
+            tune.stepper_mark_high_request = false;
+            debug_print_stepper_state("STEPPER HIGH MARKED");
+        }
+
+        if (tune.stepper_mark_low_request) {
+            stepper_arm_mark_low_limit();
+            tune.stepper_mark_low_request = false;
+            debug_print_stepper_state("STEPPER LOW MARKED");
+        }
+
+        if (tune.stepper_print_request) {
+            tune.stepper_print_request = false;
+            debug_print_stepper_state("STEPPER STATE");
+        }
+
+        if (tune.ball_stop_request) {
+            ball_balance_stop();
+            tune.ball_stop_request = false;
+            debug_puts("BALL STOP\r\n");
+        }
+
+        if (tune.ball_start_request) {
+            tune.run = false;
+            tune.line_active = false;
+            tune.brake_request = true;
+            ball_balance_start_sequence();
+            tune.ball_start_request = false;
+            debug_puts("BALL Q3 START\r\n");
+        }
+
+        if (tune.ball_target_request) {
+            tune.run = false;
+            tune.line_active = false;
+            tune.brake_request = true;
+            ball_balance_hold_target(tune.ball_target_mm);
+            tune.ball_target_request = false;
+            debug_puts("BALL TARGET MM ");
+            debug_print_i32((int32_t)tune.ball_target_mm);
+            debug_puts("\r\n");
         }
 
         if (tune.reset_pid) {
@@ -332,18 +580,59 @@ int main(void)
         }
 
         if (b5_press_event()) {
-            debug_print_keys("KEY B5 STOP", &tune);
-            stop_car(&tune);
+            debug_print_keys("KEY K1 NEXT", &tune);
+            stop_line_outputs(&tune);
+            ball_balance_stop();
+            stepper_arm_stop();
+            mode_started = false;
+            line_paused = false;
+            app_mode = (AppMode)(((uint8_t)app_mode + 1U) %
+                (uint8_t)APP_MODE_COUNT);
+            if (app_mode == APP_MODE_LINE_TIMER) {
+                apply_line_mode_params(&tune);
+                pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
+                pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
+            }
+            debug_print_mode("MODE SWITCH", app_mode);
         }
 
         if (b15_press_event()) {
-            debug_print_keys("KEY B15 EVENT", &tune);
-            if (!tune.run) {
-                debug_puts("KEY B15 START\r\n");
-                start_line_tracking(&tune);
+            debug_print_keys("KEY K4 START", &tune);
+            if (app_mode == APP_MODE_LINE_TIMER) {
+                if (!tune.run) {
+                    mode_started = true;
+                    if (line_paused) {
+                        line_paused = false;
+                        debug_puts("MODE LINE RESUME\r\n");
+                        resume_line_tracking(&tune);
+                    } else {
+                        debug_puts("MODE LINE START\r\n");
+                        start_line_tracking(&tune);
+                    }
+                } else {
+                    debug_puts("MODE LINE ALREADY RUN\r\n");
+                }
             } else {
-                debug_puts("KEY B15 IGNORED RUNNING\r\n");
+                stop_line_outputs(&tune);
+                mode_started = true;
+                line_paused = false;
+                debug_puts("MODE STEPPER START\r\n");
+                debug_print_stepper_state("STEPPER READY");
             }
+        }
+
+        if (app_mode == APP_MODE_LINE_TIMER) {
+            if (b11_press_event()) {
+                clear_line_timer();
+            }
+            if (b14_press_event() && tune.run) {
+                line_paused = true;
+                pause_line_tracking(&tune);
+            }
+        }
+
+        if ((app_mode == APP_MODE_STEPPER_MANUAL) && mode_started) {
+            stepper_jog_buttons_service(&g_stepper_mode_params);
         }
 
         if (tune.brake_request) {
@@ -438,10 +727,24 @@ int main(void)
             }
         }
 
+        {
+            bool ball_sample_ok = k230_ball_get_sample(&ball_sample,
+                g_ms_ticks);
+
+            ball_balance_update(g_ms_ticks, ball_sample_ok, &ball_sample);
+        }
+
 #if OLED_RUNTIME_ENABLE
         if ((g_ms_ticks - last_oled_ms) >= 200U) {
             last_oled_ms += 200U;
-            oled_show_motion(&motion, g_run_time_ms, tune.run);
+            if (app_mode == APP_MODE_LINE_TIMER) {
+                oled_show_line_mode(g_run_time_ms, mode_started, tune.run,
+                    line_paused);
+            } else {
+                StepperArmState stepper_state = stepper_arm_get_state();
+
+                oled_show_stepper_mode(&stepper_state, mode_started);
+            }
         }
 #endif
 

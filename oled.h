@@ -1,7 +1,9 @@
 #ifndef OLED_H
 #define OLED_H
 
+#include "app_config.h"
 #include "motion_state.h"
+#include "stepper_arm.h"
 #include "ti_msp_dl_config.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -328,18 +330,64 @@ static inline void oled_make_time_text(char *dst, uint32_t run_time_ms)
     dst[13] = '\0';
 }
 
-static inline void oled_show_motion(const MotionState *state,
-                                    uint32_t run_time_ms,
-                                    bool running)
+static inline void oled_make_step_angle_text(char *dst, int32_t steps)
+{
+    uint32_t angle_tenths;
+    uint32_t whole;
+    uint32_t tenth;
+
+    if (steps < 0) {
+        steps = -steps;
+    }
+    angle_tenths = (uint32_t)((((float)steps) * STEPPER_STEP_DEG * 10.0f) +
+        0.5f);
+    whole = angle_tenths / 10U;
+    tenth = angle_tenths % 10U;
+
+    dst[0] = 'A';
+    dst[1] = 'N';
+    dst[2] = 'G';
+    dst[3] = ':';
+    oled_i32_to_text(&dst[4], (int32_t)whole);
+    while (*dst != '\0') {
+        dst++;
+    }
+    *dst++ = '.';
+    *dst++ = (char)('0' + tenth);
+    *dst++ = 'D';
+    *dst = '\0';
+}
+
+static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
+                                       bool running, bool paused)
 {
     char line[20];
 
-    (void)state;
     oled_puts_fixed(0U, 0U, "26H CAR", 21U);
-    oled_puts_fixed(2U, 0U, running ? "MODE:RUN" : "MODE:STOP", 21U);
+    if (paused) {
+        oled_puts_fixed(2U, 0U, "MODE:LINE PAUSE", 21U);
+    } else {
+        oled_puts_fixed(2U, 0U, started ?
+            (running ? "MODE:LINE RUN" : "MODE:LINE DONE") :
+            "MODE:LINE RDY", 21U);
+    }
     oled_make_time_text(line, run_time_ms);
     oled_puts_fixed(4U, 0U, line, 21U);
-    oled_puts_fixed(6U, 0U, "B15 START B5 STOP", 21U);
+    oled_puts_fixed(6U, 0U, "K4 GO B14 PAUSE", 21U);
+}
+
+static inline void oled_show_stepper_mode(const StepperArmState *state,
+                                          bool started)
+{
+    char line[20];
+
+    oled_puts_fixed(0U, 0U, "26H CAR", 21U);
+    oled_puts_fixed(2U, 0U, started ? "MODE:STEP ADJ" :
+        "MODE:STEP RDY", 21U);
+    oled_make_step_angle_text(line, state->current_steps);
+    oled_puts_fixed(4U, 0U, line, 21U);
+    oled_make_line(line, "STEP:", state->current_steps);
+    oled_puts_fixed(6U, 0U, line, 21U);
 }
 
 #endif
