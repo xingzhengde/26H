@@ -31,6 +31,7 @@ void ball_balance_init(void);
 void ball_balance_start_sequence(void);
 void ball_balance_hold_target(float target_mm);
 void ball_balance_hold_q4(float target_mm);
+void ball_balance_hold_q6(float target_mm);
 void ball_balance_set_feedforward(float pipe_angle_deg);
 void ball_balance_set_initial_feedforward(float pipe_angle_deg);
 void ball_balance_stop(void);

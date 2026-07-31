@@ -16,6 +16,15 @@ typedef struct {
     bool valid;
 } K230BallSample;
 
+typedef struct {
+    uint8_t mode;
+    uint8_t run_state;
+    int16_t target_mm;
+    uint8_t sequence_phase;
+    uint32_t timestamp_ms;
+    bool valid;
+} K230ControlState;
+
 /*
  * 0x81 MCU status 帧的 flags 定义。低四位与 main_new.py 的显示和
  * 完成判定保持一致；高位额外提供模式和 X42S 在线信息，旧接收端会忽略。
@@ -26,10 +35,12 @@ typedef struct {
 #define K230_MCU_FLAG_FAULT         (0x08U)
 #define K230_MCU_FLAG_X42S_ONLINE   (0x10U)
 #define K230_MCU_FLAG_MODE_Q4       (0x20U)
+#define K230_MCU_FLAG_MODE_Q6       (0x40U)
 
 void k230_ball_init(void);
 void k230_ball_handle_irq(uint32_t now_ms);
 bool k230_ball_get_sample(K230BallSample *sample, uint32_t now_ms);
+bool k230_ball_get_control_state(K230ControlState *state, uint32_t now_ms);
 void k230_ball_send_mcu_status(uint8_t phase, int16_t target_mm,
                               int16_t angle_cdeg, int16_t velocity_mm_s,
                               uint8_t flags);

@@ -363,14 +363,22 @@ static inline void oled_make_step_angle_text(char *dst, int32_t steps)
 
 static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
                                        bool running, bool paused,
-                                       bool q4_mode,
+                                       uint8_t competition_mode,
                                        int32_t ball_position_mm,
                                        bool x42s_ok)
 {
     char line[20];
 
     oled_puts_fixed(0U, 0U, "26H CAR", 21U);
-    if (q4_mode) {
+    if (competition_mode == 3U) {
+        if (paused) {
+            oled_puts_fixed(2U, 0U, "M3 Q6 ANY PAUSE", 21U);
+        } else {
+            oled_puts_fixed(2U, 0U, started ?
+                (running ? "M3 Q6 ANY RUN" : "M3 Q6 ANY DONE") :
+                "M3 Q6 ANY READY", 21U);
+        }
+    } else if (competition_mode == 2U) {
         if (paused) {
             oled_puts_fixed(2U, 0U, "M2 Q4 PAUSE", 21U);
         } else {
@@ -389,7 +397,7 @@ static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
     }
     oled_make_time_text(line, run_time_ms);
     oled_puts_fixed(4U, 0U, line, 21U);
-    if (q4_mode) {
+    if (competition_mode >= 2U) {
         oled_make_line(line, x42s_ok ? "BALL:" : "X42S! BALL:",
             ball_position_mm);
         oled_puts_fixed(6U, 0U, line, 21U);

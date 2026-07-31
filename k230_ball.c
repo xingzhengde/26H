@@ -7,6 +7,7 @@
 #define K230_FRAME_HEAD_0 0xAAU
 #define K230_FRAME_HEAD_1 0x55U
 #define K230_MSG_BALL_POSITION 0x01U
+#define K230_MSG_CONTROL_STATE 0x02U
 #define K230_MSG_MCU_STATUS 0x81U
 #define K230_MAX_PAYLOAD_SIZE 8U
 
@@ -15,6 +16,7 @@ static volatile uint16_t g_rx_head;
 static volatile uint16_t g_rx_tail;
 static volatile uint32_t g_irq_time_ms;
 static K230BallSample g_sample;
+static K230ControlState g_control_state;
 
 typedef enum {
     K230_PARSE_HEAD_0 = 0,
@@ -91,6 +93,16 @@ static void handle_valid_frame(void)
             g_sample.vision_latency_valid = false;
         }
         g_sample.valid = true;
+    } else if ((g_frame_type == K230_MSG_CONTROL_STATE) &&
+               (g_frame_length == 5U)) {
+        g_control_state.mode = g_frame_payload[0];
+        g_control_state.run_state = g_frame_payload[1];
+        g_control_state.target_mm = (int16_t)(
+            (uint16_t)g_frame_payload[2] |
+            ((uint16_t)g_frame_payload[3] << 8U));
+        g_control_state.sequence_phase = g_frame_payload[4];
+        g_control_state.timestamp_ms = g_irq_time_ms;
+        g_control_state.valid = true;
     }
 }
 
@@ -163,6 +175,7 @@ void k230_ball_init(void)
     g_sample.frame_meta_valid = false;
     g_sample.vision_latency_valid = false;
     g_sample.valid = false;
+    g_control_state.valid = false;
     NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 }
 
@@ -204,6 +217,21 @@ bool k230_ball_get_sample(K230BallSample *sample, uint32_t now_ms)
         return false;
     }
     *sample = g_sample;
+    return true;
+}
+
+bool k230_ball_get_control_state(K230ControlState *state, uint32_t now_ms)
+{
+    uint8_t byte;
+
+    while (rx_pop(&byte)) {
+        parse_byte(byte);
+    }
+    if (!g_control_state.valid ||
+        ((now_ms - g_control_state.timestamp_ms) > K230_BALL_TIMEOUT_MS)) {
+        return false;
+    }
+    *state = g_control_state;
     return true;
 }
 

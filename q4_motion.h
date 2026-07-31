@@ -20,11 +20,18 @@ typedef struct {
     bool passed_b_time;
 } Q4MotionSetpoint;
 
+typedef enum {
+    Q4_MOTION_PROFILE_CENTER = 0,
+    Q4_MOTION_PROFILE_ARBITRARY
+} Q4MotionProfile;
+
 void q4_motion_init(void);
+void q4_motion_select_profile(Q4MotionProfile profile);
 void q4_motion_start(uint32_t now_ms);
 void q4_motion_stop(void);
 bool q4_motion_is_active(void);
 float q4_motion_get_start_feedforward_deg(void);
+uint32_t q4_motion_get_preload_lead_ms(void);
 void q4_motion_get_setpoint(uint32_t now_ms, int32_t measured_speed_cps,
                             int32_t measured_accel_cps2,
                             Q4MotionSetpoint *setpoint);

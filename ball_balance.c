@@ -18,6 +18,44 @@ static float g_filtered_accel_mm_s2;
 static float g_feedforward_deg;
 static float g_feedback_deg;
 static bool g_q4_hold_active;
+static bool g_q6_hold_active;
+
+typedef struct {
+    float pos_kp, pos_ki, pos_kd, pos_weight;
+    float speed_kp, speed_ki, speed_kd, speed_weight;
+    float deadband_mm, pos_int_limit, speed_int_limit;
+    float accel_limit, position_filter, velocity_filter, accel_filter;
+    uint8_t median_delay_frames;
+    uint32_t actuator_lookahead_ms, lookahead_max_ms;
+    float predict_pos_max, predict_speed_max;
+    float pos_out_max_deg, speed_out_max_deg, max_theta;
+} BallPidConfig;
+
+static const BallPidConfig g_q4_pid = {
+    Q4_BALL_POS_KP, Q4_BALL_POS_KI, Q4_BALL_POS_KD, Q4_BALL_POS_WEIGHT,
+    Q4_BALL_SPEED_KP, Q4_BALL_SPEED_KI, Q4_BALL_SPEED_KD,
+    Q4_BALL_SPEED_WEIGHT, Q4_BALL_PID_DEADBAND_MM,
+    Q4_BALL_PID_INT_LIMIT, Q4_BALL_SPEED_INT_LIMIT,
+    Q4_BALL_ACCEL_LIMIT_MM_S2, Q4_BALL_POSITION_FILTER_NEW,
+    Q4_BALL_VELOCITY_FILTER_NEW, Q4_BALL_ACCEL_FILTER_NEW,
+    Q4_BALL_MEDIAN_DELAY_FRAMES, Q4_BALL_ACTUATOR_LOOKAHEAD_MS,
+    Q4_BALL_LOOKAHEAD_MAX_MS, Q4_BALL_PREDICT_POS_MAX_MM,
+    Q4_BALL_PREDICT_SPEED_DELTA_MAX, Q4_BALL_POS_OUT_MAX_DEG,
+    Q4_BALL_SPEED_OUT_MAX_DEG, Q4_BALL_PID_MAX_THETA
+};
+
+static const BallPidConfig g_q6_pid = {
+    Q6_BALL_POS_KP, Q6_BALL_POS_KI, Q6_BALL_POS_KD, Q6_BALL_POS_WEIGHT,
+    Q6_BALL_SPEED_KP, Q6_BALL_SPEED_KI, Q6_BALL_SPEED_KD,
+    Q6_BALL_SPEED_WEIGHT, Q6_BALL_PID_DEADBAND_MM,
+    Q6_BALL_PID_INT_LIMIT, Q6_BALL_SPEED_INT_LIMIT,
+    Q6_BALL_ACCEL_LIMIT_MM_S2, Q6_BALL_POSITION_FILTER_NEW,
+    Q6_BALL_VELOCITY_FILTER_NEW, Q6_BALL_ACCEL_FILTER_NEW,
+    Q6_BALL_MEDIAN_DELAY_FRAMES, Q6_BALL_ACTUATOR_LOOKAHEAD_MS,
+    Q6_BALL_LOOKAHEAD_MAX_MS, Q6_BALL_PREDICT_POS_MAX_MM,
+    Q6_BALL_PREDICT_SPEED_DELTA_MAX, Q6_BALL_POS_OUT_MAX_DEG,
+    Q6_BALL_SPEED_OUT_MAX_DEG, Q6_BALL_PID_MAX_THETA
+};
 
 /**
  * @brief 浮点限幅，防止视觉异常值或积分累积产生危险倾角。
@@ -94,6 +132,7 @@ void ball_balance_init(void)
 {
     g_feedforward_deg = 0.0f;
     g_q4_hold_active = false;
+    g_q6_hold_active = false;
     g_state.mode = BALL_MODE_IDLE;
     g_state.target_mm = 0.0f;
     g_state.sample_ok = false;
@@ -103,6 +142,7 @@ void ball_balance_init(void)
 void ball_balance_start_sequence(void)
 {
     g_q4_hold_active = false;
+    g_q6_hold_active = false;
     g_state.mode = BALL_MODE_SEQ_PLUS;
     g_state.target_mm = BALL_TARGET_PLUS_MM;
     reset_loop_state();
@@ -111,6 +151,7 @@ void ball_balance_start_sequence(void)
 void ball_balance_hold_target(float target_mm)
 {
     g_q4_hold_active = false;
+    g_q6_hold_active = false;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -119,6 +160,16 @@ void ball_balance_hold_target(float target_mm)
 void ball_balance_hold_q4(float target_mm)
 {
     g_q4_hold_active = true;
+    g_q6_hold_active = false;
+    g_state.mode = BALL_MODE_HOLD_TARGET;
+    g_state.target_mm = target_mm;
+    reset_loop_state();
+}
+
+void ball_balance_hold_q6(float target_mm)
+{
+    g_q4_hold_active = true;
+    g_q6_hold_active = true;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -126,8 +177,10 @@ void ball_balance_hold_q4(float target_mm)
 
 void ball_balance_set_feedforward(float pipe_angle_deg)
 {
-    g_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
-        -Q4_MAX_FEEDFORWARD_DEG, Q4_MAX_FEEDFORWARD_DEG);
+    float max_deg = g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
+        Q4_MAX_FEEDFORWARD_DEG;
+
+    g_feedforward_deg = clamp_f32_ball(pipe_angle_deg, -max_deg, max_deg);
     if (g_q4_hold_active) {
         /* B15 启动时立即把前馈目标提交给 X42S，不等待下一帧视觉数据。 */
         apply_pipe_command();
@@ -136,11 +189,15 @@ void ball_balance_set_feedforward(float pipe_angle_deg)
 
 void ball_balance_set_initial_feedforward(float pipe_angle_deg)
 {
-    g_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
-        -Q4_MAX_FEEDFORWARD_DEG, Q4_MAX_FEEDFORWARD_DEG);
+    float max_deg = g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
+        Q4_MAX_FEEDFORWARD_DEG;
+    float rate_deg_s = g_q6_hold_active ?
+        Q6_INITIAL_ANGLE_RATE_DEG_S : Q4_INITIAL_ANGLE_RATE_DEG_S;
+
+    g_feedforward_deg = clamp_f32_ball(pipe_angle_deg, -max_deg, max_deg);
     if (g_q4_hold_active) {
         /* 启动补偿直接高速到达目标角，正常 PID 接管后仍使用原来的微调速度。 */
-        apply_pipe_command_with_rate(Q4_INITIAL_ANGLE_RATE_DEG_S);
+        apply_pipe_command_with_rate(rate_deg_s);
     }
 }
 
@@ -148,6 +205,7 @@ void ball_balance_stop(void)
 {
     g_state.mode = BALL_MODE_IDLE;
     g_q4_hold_active = false;
+    g_q6_hold_active = false;
     g_feedforward_deg = 0.0f;
     reset_loop_state();
     apply_pipe_command();
@@ -198,6 +256,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     float target_velocity;
     float speed_error;
     uint32_t sample_dt_ms;
+    const BallPidConfig *pid_cfg = g_q6_hold_active ?
+        &g_q6_pid : &g_q4_pid;
 
     (void)now_ms;
     g_state.sample_ok = sample_ok;
@@ -282,18 +342,18 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     raw_velocity = (sample->x_mm - g_last_raw_pos_mm) / dt_s;
     raw_accel = (raw_velocity - g_last_raw_velocity_mm_s) / dt_s;
     raw_accel = clamp_f32_ball(raw_accel,
-        -Q4_BALL_ACCEL_LIMIT_MM_S2, Q4_BALL_ACCEL_LIMIT_MM_S2);
+        -pid_cfg->accel_limit, pid_cfg->accel_limit);
     g_filtered_accel_mm_s2 =
-        ((1.0f - Q4_BALL_ACCEL_FILTER_NEW) *
+        ((1.0f - pid_cfg->accel_filter) *
          g_filtered_accel_mm_s2) +
-        (Q4_BALL_ACCEL_FILTER_NEW * raw_accel);
+        (pid_cfg->accel_filter * raw_accel);
     g_state.position_mm =
-        ((1.0f - Q4_BALL_POSITION_FILTER_NEW) * g_state.position_mm) +
-        (Q4_BALL_POSITION_FILTER_NEW * sample->x_mm);
+        ((1.0f - pid_cfg->position_filter) * g_state.position_mm) +
+        (pid_cfg->position_filter * sample->x_mm);
     g_state.velocity_mm_s =
-        ((1.0f - Q4_BALL_VELOCITY_FILTER_NEW) *
+        ((1.0f - pid_cfg->velocity_filter) *
          g_state.velocity_mm_s) +
-        (Q4_BALL_VELOCITY_FILTER_NEW * raw_velocity);
+        (pid_cfg->velocity_filter * raw_velocity);
     g_last_raw_velocity_mm_s = raw_velocity;
     g_last_raw_pos_mm = sample->x_mm;
     g_last_sample_timestamp_ms = sample->timestamp_ms;
@@ -307,27 +367,26 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
      * 因此速度 PI 输出前有负号。
      */
     {
-        uint32_t lookahead_ms = Q4_BALL_ACTUATOR_LOOKAHEAD_MS;
+        uint32_t lookahead_ms = pid_cfg->actuator_lookahead_ms;
 
         if (sample->frame_meta_valid) {
-            lookahead_ms += sample_dt_ms * Q4_BALL_MEDIAN_DELAY_FRAMES;
+            lookahead_ms += sample_dt_ms * pid_cfg->median_delay_frames;
         }
         if (sample->vision_latency_valid) {
             lookahead_ms += sample->vision_latency_ms;
         }
-        if (lookahead_ms > Q4_BALL_LOOKAHEAD_MAX_MS) {
-            lookahead_ms = Q4_BALL_LOOKAHEAD_MAX_MS;
+        if (lookahead_ms > pid_cfg->lookahead_max_ms) {
+            lookahead_ms = pid_cfg->lookahead_max_ms;
         }
         lookahead_s = (float)lookahead_ms / 1000.0f;
     }
 
     predicted_position_delta = clamp_f32_ball(
         g_state.velocity_mm_s * lookahead_s,
-        -Q4_BALL_PREDICT_POS_MAX_MM, Q4_BALL_PREDICT_POS_MAX_MM);
+        -pid_cfg->predict_pos_max, pid_cfg->predict_pos_max);
     predicted_speed_delta = clamp_f32_ball(
         g_filtered_accel_mm_s2 * lookahead_s,
-        -Q4_BALL_PREDICT_SPEED_DELTA_MAX,
-        Q4_BALL_PREDICT_SPEED_DELTA_MAX);
+        -pid_cfg->predict_speed_max, pid_cfg->predict_speed_max);
     control_position_mm = g_state.position_mm + predicted_position_delta;
     control_velocity_mm_s = g_state.velocity_mm_s + predicted_speed_delta;
     pos_error = g_state.target_mm - control_position_mm;
@@ -353,44 +412,43 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
          * 模式二直接对球位置做小角度 PID。速度即位置误差的负导数，
          * 因此 D 项使用实测球速提供阻尼，避免步进电机反复推拉。
          */
-        if (abs_f32(pos_error) <= Q4_BALL_PID_DEADBAND_MM) {
+        if (abs_f32(pos_error) <= pid_cfg->deadband_mm) {
             pos_error = 0.0f;
             g_q4_position_integral *= 0.85f;
         } else {
             g_q4_position_integral += pos_error * dt_s;
             g_q4_position_integral = clamp_f32_ball(
                 g_q4_position_integral,
-                -Q4_BALL_PID_INT_LIMIT, Q4_BALL_PID_INT_LIMIT);
+                -pid_cfg->pos_int_limit, pid_cfg->pos_int_limit);
         }
         /*
          * 位置 PID 把球拉回中心；速度 PID 的目标速度固定为 0，专门抑制
          * 球继续滚动。两路先各自限幅再加权，避免视觉跳点独占全部倾角。
          */
-        position_output = (Q4_BALL_POS_KP * pos_error) +
-            (Q4_BALL_POS_KI * g_q4_position_integral) -
-            (Q4_BALL_POS_KD * control_velocity_mm_s);
+        position_output = (pid_cfg->pos_kp * pos_error) +
+            (pid_cfg->pos_ki * g_q4_position_integral) -
+            (pid_cfg->pos_kd * control_velocity_mm_s);
         position_output = clamp_f32_ball(position_output,
-            -Q4_BALL_POS_OUT_MAX_DEG, Q4_BALL_POS_OUT_MAX_DEG);
+            -pid_cfg->pos_out_max_deg, pid_cfg->pos_out_max_deg);
 
         speed_error = -control_velocity_mm_s;
         g_q4_speed_integral += speed_error * dt_s;
         g_q4_speed_integral = clamp_f32_ball(g_q4_speed_integral,
-            -Q4_BALL_SPEED_INT_LIMIT, Q4_BALL_SPEED_INT_LIMIT);
+            -pid_cfg->speed_int_limit, pid_cfg->speed_int_limit);
         speed_derivative = (speed_error - g_q4_last_speed_error) / dt_s;
         speed_derivative = clamp_f32_ball(speed_derivative,
-            -Q4_BALL_ACCEL_LIMIT_MM_S2,
-            Q4_BALL_ACCEL_LIMIT_MM_S2);
+            -pid_cfg->accel_limit, pid_cfg->accel_limit);
         g_q4_last_speed_error = speed_error;
-        speed_output = (Q4_BALL_SPEED_KP * speed_error) +
-            (Q4_BALL_SPEED_KI * g_q4_speed_integral) +
-            (Q4_BALL_SPEED_KD * speed_derivative);
+        speed_output = (pid_cfg->speed_kp * speed_error) +
+            (pid_cfg->speed_ki * g_q4_speed_integral) +
+            (pid_cfg->speed_kd * speed_derivative);
         speed_output = clamp_f32_ball(speed_output,
-            -Q4_BALL_SPEED_OUT_MAX_DEG, Q4_BALL_SPEED_OUT_MAX_DEG);
+            -pid_cfg->speed_out_max_deg, pid_cfg->speed_out_max_deg);
 
-        g_feedback_deg = -((Q4_BALL_POS_WEIGHT * position_output) +
-            (Q4_BALL_SPEED_WEIGHT * speed_output));
+        g_feedback_deg = -((pid_cfg->pos_weight * position_output) +
+            (pid_cfg->speed_weight * speed_output));
         g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-            -Q4_BALL_PID_MAX_THETA, Q4_BALL_PID_MAX_THETA);
+            -pid_cfg->max_theta, pid_cfg->max_theta);
         apply_pipe_command();
         return;
     }

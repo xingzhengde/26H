@@ -831,6 +831,30 @@ class H3StateMachine:
             self.record_arbitrary(center_x, position_mm, now)
             return
 
+        if self.mode == MODE_HOLD_ARBITRARY:
+            if self.run_state == RUN_PAUSED:
+                self.run_state = RUN_RUNNING
+                self.set_notice("RESUMED", now)
+                return
+            if self.run_state == RUN_RUNNING:
+                self.set_notice("ALREADY RUNNING", now)
+                return
+            if not self.calibration.tube_valid():
+                self.set_notice("DO MODE 2 FIRST", now)
+                return
+            if center_x is None or position_mm is None:
+                self.set_notice("BALL NOT FOUND", now)
+                return
+            self.calibration.arbitrary_pixel = int(center_x)
+            self.calibration.arbitrary_mm = int(position_mm)
+            self.calibration.save()
+            self.target_mm = int(position_mm)
+            self.run_state = RUN_RUNNING
+            self.set_notice(
+                "ANY %dMM SAVED -> HOLD" % self.target_mm, now
+            )
+            return
+
         if self.run_state == RUN_PAUSED:
             self.run_state = RUN_RUNNING
             self.set_notice("RESUMED", now)
@@ -847,12 +871,7 @@ class H3StateMachine:
             self.set_notice("DO MODE 2 FIRST", now)
             return
 
-        if self.mode == MODE_HOLD_ARBITRARY:
-            if not self.calibration.arbitrary_valid():
-                self.set_notice("DO MODE 4 FIRST", now)
-                return
-            self.target_mm = int(self.calibration.arbitrary_mm)
-        elif self.mode == MODE_Q3_SEQUENCE:
+        if self.mode == MODE_Q3_SEQUENCE:
             self.sequence_phase = SEQ_WAIT_CENTER
             self.target_mm = 0
         else:
@@ -937,9 +956,9 @@ class H3StateMachine:
                 return "PLACE BALL AT O"
             return "TARGET %dMM" % self.target_mm
         if self.mode == MODE_HOLD_ARBITRARY:
-            if self.calibration.arbitrary_valid():
-                return "TARGET %dMM" % self.calibration.arbitrary_mm
-            return "NO ANY POINT"
+            if self.run_state == RUN_IDLE:
+                return "PLACE BALL; KEY1 SET TARGET"
+            return "TARGET %dMM" % self.target_mm
         return "POSITION OUTPUT"
 
 
@@ -1220,6 +1239,9 @@ def main():
                     MODE_TUBE_CAL,
                     MODE_Q3_CAL,
                     MODE_ARBITRARY_CAL,
+                ) or (
+                    state.mode == MODE_HOLD_ARBITRARY
+                    and state.run_state == RUN_IDLE
                 )
                 center_stable = (
                     len(recent_centers_x) >= 3
