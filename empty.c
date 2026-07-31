@@ -274,6 +274,80 @@ static float clamp_f32(float value, float min_value, float max_value)
     return value;
 }
 
+/*
+ * 仅供模式三使用：循迹误差刚进入弯道区间便快速建立纵向减速补偿，
+ * 出弯时降低滤波权重，避免水管目标角突然跳回零位。
+ */
+static float q6_curve_feedforward_update(float current_deg,
+                                         int16_t line_error,
+                                         bool line_valid,
+                                         uint32_t now_ms,
+                                         bool *curve_active,
+                                         uint32_t *curve_enter_ms,
+                                         uint32_t *straight_since_ms)
+{
+    float target_deg = 0.0f;
+    int32_t error_abs = (line_error < 0) ?
+        -(int32_t)line_error : (int32_t)line_error;
+
+#if Q6_CURVE_FF_ENABLE
+    if (line_valid && (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
+        if (!*curve_active) {
+            *curve_active = true;
+            *curve_enter_ms = now_ms;
+        }
+        *straight_since_ms = 0U;
+    } else if (*curve_active && line_valid &&
+               ((now_ms - *curve_enter_ms) >=
+                Q6_CURVE_FF_MIN_HOLD_MS) &&
+               (error_abs <= Q6_CURVE_FF_EXIT_ERR)) {
+        if (*straight_since_ms == 0U) {
+            *straight_since_ms = now_ms;
+        } else if ((now_ms - *straight_since_ms) >=
+                   Q6_CURVE_FF_EXIT_CONFIRM_MS) {
+            *curve_active = false;
+            *straight_since_ms = 0U;
+        }
+    } else if (*curve_active && line_valid) {
+        *straight_since_ms = 0U;
+    }
+
+    if (*curve_active) {
+        float ratio = (float)(error_abs - Q6_CURVE_FF_ENTRY_ERR) /
+            (float)(Q6_CURVE_FF_FULL_ERR - Q6_CURVE_FF_ENTRY_ERR);
+        float demand_deg;
+
+        ratio = clamp_f32(ratio, 0.0f, 1.0f);
+        demand_deg = Q6_CURVE_FF_MAX_DEG * ratio;
+        if (demand_deg < Q6_CURVE_FF_HOLD_DEG) {
+            demand_deg = Q6_CURVE_FF_HOLD_DEG;
+        }
+        target_deg = Q6_CURVE_FF_SIGN * demand_deg;
+    }
+#else
+    (void)error_abs;
+    (void)now_ms;
+    (void)curve_active;
+    (void)curve_enter_ms;
+    (void)straight_since_ms;
+#endif
+
+    {
+        float current_abs = (current_deg < 0.0f) ?
+            -current_deg : current_deg;
+        float target_abs = (target_deg < 0.0f) ?
+            -target_deg : target_deg;
+        float filter_new = (target_abs > current_abs) ?
+            Q6_CURVE_FF_ATTACK_NEW : Q6_CURVE_FF_RELEASE_NEW;
+
+        current_deg += filter_new * (target_deg - current_deg);
+    }
+    if ((current_deg > -0.005f) && (current_deg < 0.005f)) {
+        current_deg = 0.0f;
+    }
+    return current_deg;
+}
+
 static uint8_t count_bits_u8(uint8_t value)
 {
     uint8_t count = 0U;
@@ -688,6 +762,10 @@ int main(void)
     bool q4_preload_pending = false;
     bool q4_resume_after_preload = false;
     uint32_t q4_preload_start_ms = 0U;
+    float q6_curve_feedforward_deg = 0.0f;
+    bool q6_curve_active = false;
+    uint32_t q6_curve_enter_ms = 0U;
+    uint32_t q6_straight_since_ms = 0U;
     bool x42s_version_reported = false;
     int left_speed = 0;
     int right_speed = 0;
@@ -891,6 +969,10 @@ int main(void)
             ball_balance_stop();
             stepper_arm_stop();
             q4_preload_pending = false;
+            q6_curve_feedforward_deg = 0.0f;
+            q6_curve_active = false;
+            q6_curve_enter_ms = 0U;
+            q6_straight_since_ms = 0U;
             mode_started = false;
             line_paused = false;
             line_lap_reset(&line_lap_phase, &a_confirm_frames,
@@ -955,6 +1037,13 @@ int main(void)
                     line_paused = true;
                     q4_motion_stop();
                     ball_balance_set_feedforward(0.0f);
+                    if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                        q6_curve_feedforward_deg = 0.0f;
+                        q6_curve_active = false;
+                        q6_curve_enter_ms = 0U;
+                        q6_straight_since_ms = 0U;
+                        ball_balance_set_curve_feedforward(0.0f);
+                    }
                     debug_puts("MODE Q4 PAUSE\r\n");
                     pause_line_tracking(&tune);
                 } else {
@@ -973,6 +1062,11 @@ int main(void)
                         ball_balance_hold_q6(clamp_f32(
                             (float)k230_control.target_mm,
                             -150.0f, 150.0f));
+                        q6_curve_feedforward_deg = 0.0f;
+                        q6_curve_active = false;
+                        q6_curve_enter_ms = 0U;
+                        q6_straight_since_ms = 0U;
+                        ball_balance_set_curve_feedforward(0.0f);
                     } else {
                         ball_balance_hold_q4(Q4_BALL_TARGET_MM);
                     }
@@ -1174,6 +1268,17 @@ int main(void)
                 tune.line_error = tracker.error;
                 tune.line_correction = speed_delta;
                 tune.line_valid = tracker.valid;
+
+                if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                    q6_curve_feedforward_deg =
+                        q6_curve_feedforward_update(
+                            q6_curve_feedforward_deg,
+                            tracker.error, tracker.valid, g_ms_ticks,
+                            &q6_curve_active, &q6_curve_enter_ms,
+                            &q6_straight_since_ms);
+                    ball_balance_set_curve_feedforward(
+                        q6_curve_feedforward_deg);
+                }
 
                 base_target = drive_target;
                 if (tracker.valid &&

@@ -16,6 +16,7 @@ static float g_q4_last_speed_error;
 static float g_last_raw_velocity_mm_s;
 static float g_filtered_accel_mm_s2;
 static float g_feedforward_deg;
+static float g_curve_feedforward_deg;
 static float g_feedback_deg;
 static bool g_q4_hold_active;
 static bool g_q6_hold_active;
@@ -84,11 +85,12 @@ static float abs_f32(float value)
  */
 static void apply_pipe_command_with_rate(float motor_rate_deg_s)
 {
-    float total_angle = g_feedforward_deg + g_feedback_deg;
+    float total_angle = g_feedforward_deg + g_curve_feedforward_deg +
+        g_feedback_deg;
 
     total_angle = clamp_f32_ball(total_angle,
         -BALL_SPEED_MAX_THETA, BALL_SPEED_MAX_THETA);
-    g_state.feedforward_deg = g_feedforward_deg;
+    g_state.feedforward_deg = g_feedforward_deg + g_curve_feedforward_deg;
     g_state.feedback_deg = g_feedback_deg;
     g_state.theta_deg = total_angle;
     stepper_arm_set_pipe_angle(
@@ -122,15 +124,16 @@ static void reset_loop_state(void)
     g_feedback_deg = 0.0f;
     g_state.position_mm = 0.0f;
     g_state.velocity_mm_s = 0.0f;
-    g_state.feedforward_deg = g_feedforward_deg;
+    g_state.feedforward_deg = g_feedforward_deg + g_curve_feedforward_deg;
     g_state.feedback_deg = 0.0f;
     g_state.settle_count = 0U;
-    g_state.theta_deg = g_feedforward_deg;
+    g_state.theta_deg = g_feedforward_deg + g_curve_feedforward_deg;
 }
 
 void ball_balance_init(void)
 {
     g_feedforward_deg = 0.0f;
+    g_curve_feedforward_deg = 0.0f;
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_state.mode = BALL_MODE_IDLE;
@@ -143,6 +146,7 @@ void ball_balance_start_sequence(void)
 {
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_curve_feedforward_deg = 0.0f;
     g_state.mode = BALL_MODE_SEQ_PLUS;
     g_state.target_mm = BALL_TARGET_PLUS_MM;
     reset_loop_state();
@@ -152,6 +156,7 @@ void ball_balance_hold_target(float target_mm)
 {
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_curve_feedforward_deg = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -161,6 +166,7 @@ void ball_balance_hold_q4(float target_mm)
 {
     g_q4_hold_active = true;
     g_q6_hold_active = false;
+    g_curve_feedforward_deg = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -170,6 +176,7 @@ void ball_balance_hold_q6(float target_mm)
 {
     g_q4_hold_active = true;
     g_q6_hold_active = true;
+    g_curve_feedforward_deg = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -185,6 +192,18 @@ void ball_balance_set_feedforward(float pipe_angle_deg)
         /* B15 启动时立即把前馈目标提交给 X42S，不等待下一帧视觉数据。 */
         apply_pipe_command();
     }
+}
+
+void ball_balance_set_curve_feedforward(float pipe_angle_deg)
+{
+    if (!g_q6_hold_active) {
+        g_curve_feedforward_deg = 0.0f;
+        return;
+    }
+    g_curve_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
+        -Q6_CURVE_FF_MAX_DEG, Q6_CURVE_FF_MAX_DEG);
+    /* 弯道前馈独立叠加，不触发启动阶段的 PID 冻结。 */
+    apply_pipe_command();
 }
 
 void ball_balance_set_initial_feedforward(float pipe_angle_deg)
@@ -207,6 +226,7 @@ void ball_balance_stop(void)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_feedforward_deg = 0.0f;
+    g_curve_feedforward_deg = 0.0f;
     reset_loop_state();
     apply_pipe_command();
 }

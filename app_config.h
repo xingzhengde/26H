@@ -131,6 +131,18 @@
 #define Q6_PRELOAD_LEAD_MS        (100U)
 #define Q6_INITIAL_ANGLE_RATE_DEG_S (240.0f)
 #define Q6_FEEDFORWARD_SIGN       (1.0f)
+/* 模式三入弯纵向减速前馈；提前介入、快速建立、平滑退出。 */
+#define Q6_CURVE_FF_ENABLE        (1)
+#define Q6_CURVE_FF_ENTRY_ERR     (8)
+#define Q6_CURVE_FF_EXIT_ERR      (4)
+#define Q6_CURVE_FF_FULL_ERR      (24)
+#define Q6_CURVE_FF_MAX_DEG       (0.75f)
+#define Q6_CURVE_FF_HOLD_DEG      (0.45f)
+#define Q6_CURVE_FF_SIGN          (-1.0f)
+#define Q6_CURVE_FF_ATTACK_NEW    (0.65f)
+#define Q6_CURVE_FF_RELEASE_NEW   (0.25f)
+#define Q6_CURVE_FF_MIN_HOLD_MS   (1000U)
+#define Q6_CURVE_FF_EXIT_CONFIRM_MS (300U)
 
 #define Q6_BALL_POS_KP            (0.080f)
 #define Q6_BALL_POS_KI            (0.004f)
