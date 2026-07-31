@@ -46,8 +46,12 @@ static inline void motion_state_update(MotionState *state,
 
     raw_accel = ((state->speed_cps - state->prev_speed_cps) * 1000) /
                 (int32_t)period_ms;
+    /*
+     * 编码器差分会放大单周期量化噪声。1/8 新值低通仍能在约 160ms 内
+     * 跟随真实起步加速度，同时避免 X42S 因加速度正负抖动来回修正。
+     */
     state->filtered_accel_cps2 =
-        ((state->filtered_accel_cps2 * 3) + raw_accel) / 4;
+        ((state->filtered_accel_cps2 * 7) + raw_accel) / 8;
     state->accel_cps2 = state->filtered_accel_cps2;
     state->prev_speed_cps = state->speed_cps;
 }

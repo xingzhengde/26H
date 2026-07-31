@@ -8,6 +8,7 @@
 #include "motor.h"
 #include "oled.h"
 #include "pid.h"
+#include "q4_motion.h"
 #include "stepper_arm.h"
 #include "ti_msp_dl_config.h"
 #include "uart_tune.h"
@@ -21,8 +22,13 @@ static bool g_buttons_released_after_boot;
 
 typedef enum {
     APP_MODE_LINE_TIMER = 0,
-    APP_MODE_STEPPER_MANUAL,
-    APP_MODE_COUNT
+    APP_MODE_Q4_AB,
+    APP_MODE_COUNT,
+    /*
+     * 保留步进机构调试代码，但不放入 B5 的比赛模式循环。
+     * B5 现场操作严格只在模式一和模式二之间切换。
+     */
+    APP_MODE_STEPPER_MANUAL
 } AppMode;
 
 typedef enum {
@@ -79,6 +85,30 @@ static const LineModeParams g_line_mode_params = {
     LINE_DEFAULT_KD,
     LINE_CORR_LIMIT,
     LINE_SEARCH_PWM,
+    A_MARK_DEFAULT_TOTAL,
+    A_MARK_DEFAULT_SPAN,
+    A_MARK_DEFAULT_FRAMES,
+    A_MARK_MIN_LAP_MS,
+    A_MARK_MIN_LAP_COUNTS
+};
+
+/*
+ * 第四问使用独立参数副本。即使后续对 Q4 的速度、基础 PWM 或循迹
+ * 参数进行修改，也不会改变模式一的一圈计时参数。
+ */
+static const LineModeParams g_q4_mode_params = {
+    0.0f, /* 兼容参数结构的占位值；模式二不调用速度 PID。 */
+    0.0f,
+    0.0f,
+    Q4_CRUISE_TARGET_COUNTS,
+    Q4_CRUISE_BASE_PWM,
+    Q4_LEFT_PWM_TRIM,
+    Q4_RIGHT_PWM_TRIM,
+    Q4_BRAKE_MS,
+    Q4_LINE_KP,
+    Q4_LINE_KD,
+    Q4_LINE_CORR_LIMIT,
+    Q4_LINE_SEARCH_PWM,
     A_MARK_DEFAULT_TOTAL,
     A_MARK_DEFAULT_SPAN,
     A_MARK_DEFAULT_FRAMES,
@@ -149,6 +179,16 @@ static void debug_print_stepper_state(const char *tag)
     debug_print_i32(state.max_steps);
     debug_puts(" BUSY=");
     debug_print_i32(state.busy ? 1 : 0);
+    debug_puts(" COMM=");
+    debug_print_i32(state.communication_ok ? 1 : 0);
+    debug_puts(" FW=");
+    debug_print_i32((int32_t)state.firmware_version);
+    debug_puts(" HW=0x");
+    debug_print_u8_hex(state.hardware_type);
+    debug_putc('/');
+    debug_print_i32((int32_t)state.hardware_version);
+    debug_puts(" ST=0x");
+    debug_print_u8_hex(state.status_flags);
     debug_puts("\r\n");
 }
 
@@ -176,6 +216,17 @@ static int16_t ramp_to(int16_t current, int16_t target, int16_t step)
         }
     }
     return current;
+}
+
+static int16_t float_to_i16_saturated(float value)
+{
+    if (value > 32767.0f) {
+        return 32767;
+    }
+    if (value < -32768.0f) {
+        return -32768;
+    }
+    return (int16_t)value;
 }
 
 static int16_t clamp_pwm(int32_t value)
@@ -237,35 +288,48 @@ static const char *app_mode_name(AppMode mode)
 {
     switch (mode) {
     case APP_MODE_LINE_TIMER:
-        return "LINE";
+        return "M1 LINE";
+    case APP_MODE_Q4_AB:
+        return "M2 Q4";
     case APP_MODE_STEPPER_MANUAL:
-        return "STEPPER";
+        return "M3 STEPPER";
     default:
         return "UNKNOWN";
     }
 }
 
-static void apply_line_mode_params(TuneParams *tune)
+static void apply_drive_mode_params(TuneParams *tune,
+                                    const LineModeParams *params)
 {
-    tune->kp = g_line_mode_params.kp;
-    tune->ki = g_line_mode_params.ki;
-    tune->kd = g_line_mode_params.kd;
-    tune->target = g_line_mode_params.target;
-    tune->base_pwm = g_line_mode_params.base_pwm;
-    tune->left_pwm_trim = g_line_mode_params.left_pwm_trim;
-    tune->right_pwm_trim = g_line_mode_params.right_pwm_trim;
-    tune->brake_ms = g_line_mode_params.brake_ms;
-    tune->line_kp = g_line_mode_params.line_kp;
-    tune->line_kd = g_line_mode_params.line_kd;
-    tune->line_corr_limit = g_line_mode_params.line_corr_limit;
-    tune->line_search_pwm = g_line_mode_params.line_search_pwm;
-    tune->a_total_min = g_line_mode_params.a_total_min;
-    tune->a_span_min = g_line_mode_params.a_span_min;
-    tune->a_confirm_frames = g_line_mode_params.a_confirm_frames;
-    tune->a_min_lap_ms = g_line_mode_params.a_min_lap_ms;
-    tune->a_min_lap_counts = g_line_mode_params.a_min_lap_counts;
+    tune->kp = params->kp;
+    tune->ki = params->ki;
+    tune->kd = params->kd;
+    tune->target = params->target;
+    tune->base_pwm = params->base_pwm;
+    tune->left_pwm_trim = params->left_pwm_trim;
+    tune->right_pwm_trim = params->right_pwm_trim;
+    tune->brake_ms = params->brake_ms;
+    tune->line_kp = params->line_kp;
+    tune->line_kd = params->line_kd;
+    tune->line_corr_limit = params->line_corr_limit;
+    tune->line_search_pwm = params->line_search_pwm;
+    tune->a_total_min = params->a_total_min;
+    tune->a_span_min = params->a_span_min;
+    tune->a_confirm_frames = params->a_confirm_frames;
+    tune->a_min_lap_ms = params->a_min_lap_ms;
+    tune->a_min_lap_counts = params->a_min_lap_counts;
     tune->a_debug_enable = false;
     tune->reset_pid = true;
+}
+
+static void apply_line_mode_params(TuneParams *tune)
+{
+    apply_drive_mode_params(tune, &g_line_mode_params);
+}
+
+static void apply_q4_mode_params(TuneParams *tune)
+{
+    apply_drive_mode_params(tune, &g_q4_mode_params);
 }
 
 static void stepper_jog_buttons_service(const StepperModeParams *params)
@@ -547,9 +611,9 @@ void UART_2_INST_IRQHandler(void)
     k230_ball_handle_irq(g_ms_ticks);
 }
 
-void STEPPER_PWM_INST_IRQHandler(void)
+void UART_X42S_INST_IRQHandler(void)
 {
-    stepper_arm_handle_irq();
+    stepper_arm_handle_uart_irq(g_ms_ticks);
 }
 
 int main(void)
@@ -566,6 +630,7 @@ int main(void)
     uint32_t last_lag_report_ms = 0;
 #endif
     uint32_t last_boot_key_report_ms = 0;
+    uint32_t last_k230_status_ms = 0;
     uint32_t brake_until_ms = 0;
     AppMode app_mode = APP_MODE_LINE_TIMER;
     bool mode_started = false;
@@ -581,6 +646,10 @@ int main(void)
     uint32_t last_a_gate_debug_ms = 0U;
     MotionState motion;
     K230BallSample ball_sample;
+    bool ball_sample_ok = false;
+    Q4MotionSetpoint q4_setpoint;
+    bool q4_b_time_reported = false;
+    bool x42s_version_reported = false;
     int left_speed = 0;
     int right_speed = 0;
     int16_t left_pwm = 0;
@@ -594,6 +663,7 @@ int main(void)
     stepper_arm_init();
     k230_ball_init();
     ball_balance_init();
+    q4_motion_init();
     NVIC_EnableIRQ(RUN_TIMER_INST_INT_IRQN);
     __enable_irq();
     while (g_ms_ticks < 200U) {
@@ -663,7 +733,13 @@ int main(void)
             bool was_run = tune.run;
             bool changed = uart_tune_poll(&tune);
 
-            if ((app_mode != APP_MODE_LINE_TIMER) && tune.run) {
+            /*
+             * 只有“本轮确实收到串口命令，并由停止变成运行”时才拦截非模式一
+             * 的远程启动。此前这里只判断 tune.run，导致 B15 启动模式二后，
+             * 下一轮主循环马上又把 run 清零并刹车，实车表现为猛动一下就停。
+             */
+            if ((app_mode != APP_MODE_LINE_TIMER) && changed &&
+                !was_run && tune.run) {
                 tune.run = false;
                 tune.line_active = false;
                 tune.brake_request = true;
@@ -698,8 +774,10 @@ int main(void)
                 if (tune.run && (app_mode == APP_MODE_LINE_TIMER)) {
                     tune.line_active = true;
                 }
-                pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
-                pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
+                if (app_mode == APP_MODE_LINE_TIMER) {
+                    pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
+                    pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
+                }
             }
         }
 
@@ -767,6 +845,7 @@ int main(void)
         if (b5_press_event()) {
             debug_print_keys("KEY K1 NEXT", &tune);
             stop_line_outputs(&tune);
+            q4_motion_stop();
             ball_balance_stop();
             stepper_arm_stop();
             mode_started = false;
@@ -782,6 +861,8 @@ int main(void)
                 apply_line_mode_params(&tune);
                 pid_set_gains(&left_pid, tune.kp, tune.ki, tune.kd);
                 pid_set_gains(&right_pid, tune.kp, tune.ki, tune.kd);
+            } else if (app_mode == APP_MODE_Q4_AB) {
+                apply_q4_mode_params(&tune);
             }
             debug_print_mode("MODE SWITCH", app_mode);
         }
@@ -789,7 +870,11 @@ int main(void)
         if (b15_press_event()) {
             debug_print_keys("KEY K4 START", &tune);
             if (app_mode == APP_MODE_LINE_TIMER) {
-                if (!tune.run) {
+                if (tune.run) {
+                    line_paused = true;
+                    debug_puts("MODE LINE PAUSE\r\n");
+                    pause_line_tracking(&tune);
+                } else {
                     mode_started = true;
                     if (line_paused) {
                         line_paused = false;
@@ -806,15 +891,58 @@ int main(void)
                         a_baseline_span = 1U;
                         start_line_tracking(&tune);
                     }
+                }
+            } else if (app_mode == APP_MODE_Q4_AB) {
+                if (tune.run) {
+                    line_paused = true;
+                    q4_motion_stop();
+                    ball_balance_set_feedforward(0.0f);
+                    debug_puts("MODE Q4 PAUSE\r\n");
+                    pause_line_tracking(&tune);
                 } else {
-                    debug_puts("MODE LINE ALREADY RUN\r\n");
+                    q4_b_time_reported = false;
+                    /*
+                     * 每次模式二启动/继续都从零建立实际加速度估计，避免暂停
+                     * 前的编码器速度残留被误认为新的启动冲击。
+                     */
+                    motion_state_init(&motion);
+                    q4_motion_start(g_ms_ticks);
+                    ball_balance_hold_q4(Q4_BALL_TARGET_MM);
+                    /*
+                     * 与 B15 启动事件同周期置入计划加速度前馈，不等待
+                     * 编码器脉冲或下一帧 K230 数据。
+                     */
+                    ball_balance_set_feedforward(
+                        q4_motion_get_start_feedforward_deg());
+                    if (!stepper_arm_send_pending_now(g_ms_ticks)) {
+                        q4_motion_stop();
+                        ball_balance_stop();
+                        mode_started = false;
+                        debug_puts("MODE Q4 BLOCK X42S NOT READY\r\n");
+                    } else {
+                        mode_started = true;
+                        if (line_paused) {
+                            line_paused = false;
+                            debug_puts("MODE Q4 RESUME LINEAR RAMP\r\n");
+                            resume_line_tracking(&tune);
+                        } else {
+                            debug_puts("MODE Q4 START ANGLE FIRST\r\n");
+                            start_line_tracking(&tune);
+                        }
+                    }
                 }
             } else {
-                stop_line_outputs(&tune);
-                mode_started = true;
-                line_paused = false;
-                debug_puts("MODE STEPPER START\r\n");
-                debug_print_stepper_state("STEPPER READY");
+                if (mode_started) {
+                    stepper_arm_stop();
+                    mode_started = false;
+                    debug_puts("MODE STEPPER PAUSE\r\n");
+                } else {
+                    stop_line_outputs(&tune);
+                    mode_started = true;
+                    line_paused = false;
+                    debug_puts("MODE STEPPER START\r\n");
+                    debug_print_stepper_state("STEPPER READY");
+                }
             }
         }
 
@@ -836,7 +964,13 @@ int main(void)
             }
         }
 
-        if ((app_mode == APP_MODE_STEPPER_MANUAL) && mode_started) {
+        /*
+         * 模式二尚未启动时，B11/B14 可直接点动 X42S，便于赛前检查
+         * 水管角度。运行后禁止人工点动，避免与滚球平衡控制同时写目标角。
+         * 模式一中的 B11 清零、B14 暂停语义保持不变。
+         */
+        if (((app_mode == APP_MODE_Q4_AB) && !mode_started && !tune.run) ||
+            ((app_mode == APP_MODE_STEPPER_MANUAL) && mode_started)) {
             stepper_jog_buttons_service(&g_stepper_mode_params);
         }
 
@@ -853,6 +987,9 @@ int main(void)
             int32_t right_delta;
             int32_t target_left_pwm = 0;
             int32_t target_right_pwm = 0;
+            float drive_target = tune.target;
+            int32_t drive_base_pwm = tune.base_pwm;
+            float drive_ramp_ratio = 1.0f;
             uint32_t control_elapsed_ms = g_ms_ticks - last_control_ms;
 
             if (control_elapsed_ms > CONTROL_LAG_WARN_MS) {
@@ -873,6 +1010,28 @@ int main(void)
                 SPEED_CTRL_PERIOD_MS);
             left_speed = (left_delta < 0) ? (int)(-left_delta) : (int)left_delta;
             right_speed = (right_delta < 0) ? (int)(-right_delta) : (int)right_delta;
+
+            if ((app_mode == APP_MODE_Q4_AB) && tune.run &&
+                q4_motion_is_active()) {
+                q4_motion_get_setpoint(g_ms_ticks, motion.speed_cps,
+                    motion.accel_cps2, &q4_setpoint);
+                drive_target = q4_setpoint.speed_target_counts;
+                drive_base_pwm = q4_setpoint.base_pwm;
+                drive_ramp_ratio = q4_setpoint.ramp_ratio;
+                ball_balance_set_feedforward(
+                    q4_setpoint.pipe_feedforward_deg);
+
+                if (q4_setpoint.passed_b_time &&
+                    !q4_b_time_reported) {
+                    q4_b_time_reported = true;
+                    debug_puts("Q4 B TARGET TIME ");
+                    debug_print_i32((int32_t)q4_setpoint.elapsed_ms);
+                    debug_puts("\r\n");
+                }
+            } else if (app_mode == APP_MODE_Q4_AB) {
+                ball_balance_set_feedforward(0.0f);
+            }
+
             if ((app_mode == APP_MODE_LINE_TIMER) &&
                 (line_lap_phase == LINE_LAP_RUNNING)) {
                 uint32_t left_abs = (left_delta < 0) ?
@@ -888,31 +1047,53 @@ int main(void)
                 float right_target;
                 float base_target;
                 int16_t speed_delta;
+                int16_t curve_error_start =
+                    (app_mode == APP_MODE_Q4_AB) ?
+                    Q4_LINE_CURVE_ERR_START : LINE_CURVE_ERR_START;
+                float curve_target_drop =
+                    (app_mode == APP_MODE_Q4_AB) ?
+                    Q4_LINE_CURVE_TARGET_DROP : LINE_CURVE_TARGET_DROP;
 
                 gray_raw = gray_sensor_read_raw();
                 speed_delta = line_tracker_update(&tracker, gray_raw,
                     tune.line_kp, tune.line_kd, tune.line_corr_limit);
+                if (app_mode == APP_MODE_Q4_AB) {
+                    speed_delta = (int16_t)(
+                        (float)speed_delta * drive_ramp_ratio);
+                }
                 tune.line_bits = tracker.active_bits;
                 tune.line_error = tracker.error;
                 tune.line_correction = speed_delta;
                 tune.line_valid = tracker.valid;
 
-                base_target = tune.target;
+                base_target = drive_target;
                 if (tracker.valid &&
-                    ((tracker.error >= LINE_CURVE_ERR_START) ||
-                     (tracker.error <= -LINE_CURVE_ERR_START))) {
-                    base_target -= LINE_CURVE_TARGET_DROP;
-                    if (base_target < LINE_MIN_WHEEL_TARGET) {
+                    ((tracker.error >= curve_error_start) ||
+                     (tracker.error <= -curve_error_start))) {
+                    base_target -= curve_target_drop *
+                        drive_ramp_ratio;
+                    if ((app_mode != APP_MODE_Q4_AB) &&
+                        (base_target < LINE_MIN_WHEEL_TARGET)) {
                         base_target = LINE_MIN_WHEEL_TARGET;
+                    } else if (base_target < 0.0f) {
+                        base_target = 0.0f;
                     }
                 }
 
                 left_target = clamp_f32(base_target + (float)speed_delta,
-                    LINE_MIN_WHEEL_TARGET, tune.target + LINE_CORR_LIMIT);
+                    (app_mode == APP_MODE_Q4_AB) ? 0.0f :
+                        LINE_MIN_WHEEL_TARGET,
+                    drive_target +
+                        ((float)tune.line_corr_limit * drive_ramp_ratio));
                 right_target = clamp_f32(base_target - (float)speed_delta,
-                    LINE_MIN_WHEEL_TARGET, tune.target + LINE_CORR_LIMIT);
-                pid_set_target(&left_pid, left_target);
-                pid_set_target(&right_pid, right_target);
+                    (app_mode == APP_MODE_Q4_AB) ? 0.0f :
+                        LINE_MIN_WHEEL_TARGET,
+                    drive_target +
+                        ((float)tune.line_corr_limit * drive_ramp_ratio));
+                if (app_mode != APP_MODE_Q4_AB) {
+                    pid_set_target(&left_pid, left_target);
+                    pid_set_target(&right_pid, right_target);
+                }
 
                 if ((app_mode == APP_MODE_LINE_TIMER) &&
                     (line_lap_phase != LINE_LAP_IDLE) &&
@@ -1030,9 +1211,9 @@ int main(void)
                             a_baseline_total, a_baseline_span);
                     }
                 }
-            } else {
-                pid_set_target(&left_pid, tune.target);
-                pid_set_target(&right_pid, tune.target);
+            } else if (app_mode != APP_MODE_Q4_AB) {
+                pid_set_target(&left_pid, drive_target);
+                pid_set_target(&right_pid, drive_target);
             }
 
             if (brake_until_ms != 0U) {
@@ -1045,21 +1226,73 @@ int main(void)
                     motor_stop();
                 }
             } else if (tune.run) {
-                target_left_pwm = tune.base_pwm + tune.left_pwm_trim +
-                                  (int32_t)pid_update(
-                                      &left_pid, (float)left_speed);
-                target_right_pwm = tune.base_pwm + tune.right_pwm_trim +
-                                   (int32_t)pid_update(
-                                       &right_pid, (float)right_speed);
+                if (app_mode == APP_MODE_Q4_AB) {
+                    int32_t line_pwm = tune.line_active ?
+                        (int32_t)tune.line_correction : 0;
+                    int32_t q4_base_pwm = drive_base_pwm;
+                    int32_t line_error_abs = (tune.line_error < 0) ?
+                        -(int32_t)tune.line_error :
+                        (int32_t)tune.line_error;
+
+                    /*
+                     * 模式二彻底绕过速度 PID。唯一主命令是 q4_motion 生成的
+                     * 线性 PWM；循迹只允许在左右轮之间施加小幅差值，不能
+                     * 整体抬高驱动强度，因此不会在起步阶段额外加力。
+                     */
+                    if (line_pwm > Q4_LINE_PWM_LIMIT) {
+                        line_pwm = Q4_LINE_PWM_LIMIT;
+                    } else if (line_pwm < -Q4_LINE_PWM_LIMIT) {
+                        line_pwm = -Q4_LINE_PWM_LIMIT;
+                    }
+                    if (tune.line_active &&
+                        (line_error_abs >= Q4_LINE_CURVE_ERR_START)) {
+                        q4_base_pwm -= (int32_t)(
+                            (float)Q4_LINE_CURVE_PWM_DROP *
+                            drive_ramp_ratio);
+                    }
+                    if (q4_base_pwm < Q4_START_PWM) {
+                        q4_base_pwm = Q4_START_PWM;
+                    }
+                    target_left_pwm = q4_base_pwm +
+                        (int32_t)((float)tune.left_pwm_trim *
+                            drive_ramp_ratio) + line_pwm;
+                    target_right_pwm = q4_base_pwm +
+                        (int32_t)((float)tune.right_pwm_trim *
+                            drive_ramp_ratio) - line_pwm;
+                    if (target_left_pwm < 0) {
+                        target_left_pwm = 0;
+                    }
+                    if (target_right_pwm < 0) {
+                        target_right_pwm = 0;
+                    }
+                } else {
+                    target_left_pwm = drive_base_pwm +
+                                      (int32_t)tune.left_pwm_trim +
+                                      (int32_t)pid_update(
+                                          &left_pid, (float)left_speed);
+                    target_right_pwm = drive_base_pwm +
+                                       (int32_t)tune.right_pwm_trim +
+                                       (int32_t)pid_update(
+                                           &right_pid, (float)right_speed);
+                }
             } else {
                 pid_reset(&left_pid);
                 pid_reset(&right_pid);
             }
 
-            left_pwm = ramp_to(left_pwm, clamp_pwm(target_left_pwm),
-                PWM_STEP_LIMIT);
-            right_pwm = ramp_to(right_pwm, clamp_pwm(target_right_pwm),
-                PWM_STEP_LIMIT);
+            /*
+             * 模式二使用独立的极小 PWM 变化率。即使速度闭环或悬空编码器
+             * 瞬间给出大误差，输出也只能逐步增加，不可能突然冲到高转速。
+             */
+            {
+                int16_t pwm_step = (app_mode == APP_MODE_Q4_AB) ?
+                    Q4_PWM_STEP_LIMIT : PWM_STEP_LIMIT;
+
+                left_pwm = ramp_to(left_pwm, clamp_pwm(target_left_pwm),
+                    pwm_step);
+                right_pwm = ramp_to(right_pwm, clamp_pwm(target_right_pwm),
+                    pwm_step);
+            }
 
             if (tune.run) {
                 motor_set_left(left_pwm);
@@ -1071,11 +1304,57 @@ int main(void)
             }
         }
 
-        {
-            bool ball_sample_ok = k230_ball_get_sample(&ball_sample,
-                g_ms_ticks);
+        ball_sample_ok = k230_ball_get_sample(&ball_sample, g_ms_ticks);
+        ball_balance_update(g_ms_ticks, ball_sample_ok, &ball_sample);
+        stepper_arm_service(g_ms_ticks);
+        if (!x42s_version_reported) {
+            StepperArmState x42s_state = stepper_arm_get_state();
 
-            ball_balance_update(g_ms_ticks, ball_sample_ok, &ball_sample);
+            if (x42s_state.firmware_version != 0U) {
+                x42s_version_reported = true;
+                debug_print_stepper_state("X42S VERSION");
+            }
+        }
+
+        if ((g_ms_ticks - last_k230_status_ms) >= K230_STATUS_PERIOD_MS) {
+            BallBalanceState ball_state = ball_balance_get_state();
+            StepperArmState x42s_state = stepper_arm_get_state();
+            uint8_t status_flags = 0U;
+            bool ball_control_running =
+                (ball_state.mode != BALL_MODE_IDLE) &&
+                (ball_state.mode != BALL_MODE_DONE) &&
+                (ball_state.mode != BALL_MODE_ERROR);
+
+            /*
+             * K230 仅消费 0x81 状态帧，不反向接管 B5/B15 的模式逻辑。
+             * 这样模式一、模式二仍完全由天猛星按键决定，视觉端只负责显示。
+             */
+            if (tune.run || ball_control_running) {
+                status_flags |= K230_MCU_FLAG_RUNNING;
+            }
+            if (ball_sample_ok) {
+                status_flags |= K230_MCU_FLAG_SAMPLE_VALID;
+            }
+            if (ball_state.mode == BALL_MODE_DONE) {
+                status_flags |= K230_MCU_FLAG_TASK_DONE;
+            }
+            if ((ball_state.mode == BALL_MODE_ERROR) ||
+                !x42s_state.communication_ok || x42s_state.stall_fault) {
+                status_flags |= K230_MCU_FLAG_FAULT;
+            }
+            if (x42s_state.communication_ok) {
+                status_flags |= K230_MCU_FLAG_X42S_ONLINE;
+            }
+            if (app_mode == APP_MODE_Q4_AB) {
+                status_flags |= K230_MCU_FLAG_MODE_Q4;
+            }
+
+            k230_ball_send_mcu_status((uint8_t)ball_state.mode,
+                float_to_i16_saturated(ball_state.target_mm),
+                float_to_i16_saturated(ball_state.theta_deg * 100.0f),
+                float_to_i16_saturated(ball_state.velocity_mm_s),
+                status_flags);
+            last_k230_status_ms = g_ms_ticks;
         }
 
 #if OLED_RUNTIME_ENABLE
@@ -1083,9 +1362,15 @@ int main(void)
             (line_lap_phase == LINE_LAP_FINISHED)) &&
             ((g_ms_ticks - last_oled_ms) >= 500U)) {
             last_oled_ms = g_ms_ticks;
-            if (app_mode == APP_MODE_LINE_TIMER) {
+            if ((app_mode == APP_MODE_LINE_TIMER) ||
+                (app_mode == APP_MODE_Q4_AB)) {
+                BallBalanceState ball_state = ball_balance_get_state();
+                StepperArmState x42s_state = stepper_arm_get_state();
+
                 oled_show_line_mode(g_run_time_ms, mode_started, tune.run,
-                    line_paused);
+                    line_paused, app_mode == APP_MODE_Q4_AB,
+                    (int32_t)ball_state.position_mm,
+                    x42s_state.communication_ok);
             } else {
                 StepperArmState stepper_state = stepper_arm_get_state();
 

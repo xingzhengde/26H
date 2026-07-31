@@ -20,6 +20,8 @@ typedef struct {
     float target_mm;
     float position_mm;
     float velocity_mm_s;
+    float feedforward_deg;
+    float feedback_deg;
     float theta_deg;
     uint16_t settle_count;
     bool sample_ok;
@@ -28,6 +30,8 @@ typedef struct {
 void ball_balance_init(void);
 void ball_balance_start_sequence(void);
 void ball_balance_hold_target(float target_mm);
+void ball_balance_hold_q4(float target_mm);
+void ball_balance_set_feedforward(float pipe_angle_deg);
 void ball_balance_stop(void);
 void ball_balance_update(uint32_t now_ms, bool sample_ok,
                          const K230BallSample *sample);

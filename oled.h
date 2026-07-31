@@ -339,8 +339,11 @@ static inline void oled_make_step_angle_text(char *dst, int32_t steps)
     if (steps < 0) {
         steps = -steps;
     }
-    angle_tenths = (uint32_t)((((float)steps) * STEPPER_STEP_DEG * 10.0f) +
-        0.5f);
+    /*
+     * TTL 位置控制下 StepperArmState 的兼容字段以 0.01° 为单位，
+     * OLED 只显示到 0.1°，因此直接做整数换算，避免继续依赖脉冲细分。
+     */
+    angle_tenths = ((uint32_t)steps + 5U) / 10U;
     whole = angle_tenths / 10U;
     tenth = angle_tenths % 10U;
 
@@ -359,21 +362,40 @@ static inline void oled_make_step_angle_text(char *dst, int32_t steps)
 }
 
 static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
-                                       bool running, bool paused)
+                                       bool running, bool paused,
+                                       bool q4_mode,
+                                       int32_t ball_position_mm,
+                                       bool x42s_ok)
 {
     char line[20];
 
     oled_puts_fixed(0U, 0U, "26H CAR", 21U);
-    if (paused) {
-        oled_puts_fixed(2U, 0U, "MODE:LINE PAUSE", 21U);
+    if (q4_mode) {
+        if (paused) {
+            oled_puts_fixed(2U, 0U, "M2 Q4 PAUSE", 21U);
+        } else {
+            oled_puts_fixed(2U, 0U, started ?
+                (running ? "M2 Q4 RUN" : "M2 Q4 DONE") :
+                "M2 Q4 READY", 21U);
+        }
     } else {
-        oled_puts_fixed(2U, 0U, started ?
-            (running ? "MODE:LINE RUN" : "MODE:LINE DONE") :
-            "MODE:LINE RDY", 21U);
+        if (paused) {
+            oled_puts_fixed(2U, 0U, "M1 LINE PAUSE", 21U);
+        } else {
+            oled_puts_fixed(2U, 0U, started ?
+                (running ? "M1 LINE RUN" : "M1 LINE DONE") :
+                "M1 LINE READY", 21U);
+        }
     }
     oled_make_time_text(line, run_time_ms);
     oled_puts_fixed(4U, 0U, line, 21U);
-    oled_puts_fixed(6U, 0U, "B11 CLR B14 PAUSE", 21U);
+    if (q4_mode) {
+        oled_make_line(line, x42s_ok ? "BALL:" : "X42S! BALL:",
+            ball_position_mm);
+        oled_puts_fixed(6U, 0U, line, 21U);
+    } else {
+        oled_puts_fixed(6U, 0U, "B11 CLR B14 PAUSE", 21U);
+    }
 }
 
 static inline void oled_show_stepper_mode(const StepperArmState *state,
