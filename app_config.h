@@ -143,6 +143,15 @@
 #define Q6_CURVE_FF_RELEASE_NEW   (0.25f)
 #define Q6_CURVE_FF_MIN_HOLD_MS   (1000U)
 #define Q6_CURVE_FF_EXIT_CONFIRM_MS (300U)
+/* 模式三弯道内增益调度：位置略增强，速度阻尼明显增强，积分适当减弱。 */
+#define Q6_CURVE_POS_KP_SCALE     (1.10f)
+#define Q6_CURVE_POS_KI_SCALE     (0.70f)
+#define Q6_CURVE_SPEED_KP_SCALE   (1.35f)
+#define Q6_CURVE_SPEED_KI_SCALE   (0.65f)
+#define Q6_CURVE_SPEED_KD_SCALE   (1.25f)
+#define Q6_CURVE_POS_OUT_MAX_DEG  (2.10f)
+#define Q6_CURVE_SPEED_OUT_MAX_DEG (1.80f)
+#define Q6_CURVE_PID_MAX_THETA    (2.00f)
 
 #define Q6_BALL_POS_KP            (0.080f)
 #define Q6_BALL_POS_KI            (0.004f)

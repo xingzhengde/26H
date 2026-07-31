@@ -414,6 +414,16 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         float position_output;
         float speed_output;
         float speed_derivative;
+        float pos_kp = pid_cfg->pos_kp;
+        float pos_ki = pid_cfg->pos_ki;
+        float speed_kp = pid_cfg->speed_kp;
+        float speed_ki = pid_cfg->speed_ki;
+        float speed_kd = pid_cfg->speed_kd;
+        float pos_out_max = pid_cfg->pos_out_max_deg;
+        float speed_out_max = pid_cfg->speed_out_max_deg;
+        float pid_max_theta = pid_cfg->max_theta;
+        bool q6_curve_control = g_q6_hold_active &&
+            (abs_f32(g_curve_feedforward_deg) > 0.02f);
 
         /*
          * 固定启动倾角期间只更新视觉位置和速度状态，不叠加 PID 输出。
@@ -426,6 +436,17 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
             g_feedback_deg = 0.0f;
             apply_pipe_command();
             return;
+        }
+
+        if (q6_curve_control) {
+            pos_kp *= Q6_CURVE_POS_KP_SCALE;
+            pos_ki *= Q6_CURVE_POS_KI_SCALE;
+            speed_kp *= Q6_CURVE_SPEED_KP_SCALE;
+            speed_ki *= Q6_CURVE_SPEED_KI_SCALE;
+            speed_kd *= Q6_CURVE_SPEED_KD_SCALE;
+            pos_out_max = Q6_CURVE_POS_OUT_MAX_DEG;
+            speed_out_max = Q6_CURVE_SPEED_OUT_MAX_DEG;
+            pid_max_theta = Q6_CURVE_PID_MAX_THETA;
         }
 
         /*
@@ -445,11 +466,11 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
          * 位置 PID 把球拉回中心；速度 PID 的目标速度固定为 0，专门抑制
          * 球继续滚动。两路先各自限幅再加权，避免视觉跳点独占全部倾角。
          */
-        position_output = (pid_cfg->pos_kp * pos_error) +
-            (pid_cfg->pos_ki * g_q4_position_integral) -
+        position_output = (pos_kp * pos_error) +
+            (pos_ki * g_q4_position_integral) -
             (pid_cfg->pos_kd * control_velocity_mm_s);
         position_output = clamp_f32_ball(position_output,
-            -pid_cfg->pos_out_max_deg, pid_cfg->pos_out_max_deg);
+            -pos_out_max, pos_out_max);
 
         speed_error = -control_velocity_mm_s;
         g_q4_speed_integral += speed_error * dt_s;
@@ -459,16 +480,16 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         speed_derivative = clamp_f32_ball(speed_derivative,
             -pid_cfg->accel_limit, pid_cfg->accel_limit);
         g_q4_last_speed_error = speed_error;
-        speed_output = (pid_cfg->speed_kp * speed_error) +
-            (pid_cfg->speed_ki * g_q4_speed_integral) +
-            (pid_cfg->speed_kd * speed_derivative);
+        speed_output = (speed_kp * speed_error) +
+            (speed_ki * g_q4_speed_integral) +
+            (speed_kd * speed_derivative);
         speed_output = clamp_f32_ball(speed_output,
-            -pid_cfg->speed_out_max_deg, pid_cfg->speed_out_max_deg);
+            -speed_out_max, speed_out_max);
 
         g_feedback_deg = -((pid_cfg->pos_weight * position_output) +
             (pid_cfg->speed_weight * speed_output));
         g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-            -pid_cfg->max_theta, pid_cfg->max_theta);
+            -pid_max_theta, pid_max_theta);
         apply_pipe_command();
         return;
     }
