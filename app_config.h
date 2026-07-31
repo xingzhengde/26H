@@ -62,8 +62,8 @@
 #define Q4_FEEDFORWARD_ENABLE    (1)
 #define Q4_INITIAL_ANGLE_DEG     (1.70f)
 /* 启动时固定保持明确的目标倾角；到时直接交给稳定版 PID，不做渐退。 */
-#define Q4_INITIAL_ANGLE_HOLD_MS (200U)
-#define Q4_PRELOAD_LEAD_MS       (200U)
+#define Q4_INITIAL_ANGLE_HOLD_MS (100U)
+#define Q4_PRELOAD_LEAD_MS       (100U)
 #define Q4_INITIAL_ANGLE_RATE_DEG_S (240.0f)
 /* 实机确认原移动补偿方向相反：仅翻转加速度前馈，不翻转球位置反馈。 */
 #define Q4_FEEDFORWARD_SIGN      (1.0f)
