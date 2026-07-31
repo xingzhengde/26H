@@ -649,6 +649,9 @@ int main(void)
     bool ball_sample_ok = false;
     Q4MotionSetpoint q4_setpoint;
     bool q4_b_time_reported = false;
+    bool q4_preload_pending = false;
+    bool q4_resume_after_preload = false;
+    uint32_t q4_preload_start_ms = 0U;
     bool x42s_version_reported = false;
     int left_speed = 0;
     int right_speed = 0;
@@ -848,6 +851,7 @@ int main(void)
             q4_motion_stop();
             ball_balance_stop();
             stepper_arm_stop();
+            q4_preload_pending = false;
             mode_started = false;
             line_paused = false;
             line_lap_reset(&line_lap_phase, &a_confirm_frames,
@@ -893,7 +897,15 @@ int main(void)
                     }
                 }
             } else if (app_mode == APP_MODE_Q4_AB) {
-                if (tune.run) {
+                if (q4_preload_pending) {
+                    /* 预置等待期间再次按 B15，取消本次启动并回到零角。 */
+                    q4_preload_pending = false;
+                    q4_motion_stop();
+                    ball_balance_stop();
+                    mode_started = false;
+                    line_paused = false;
+                    debug_puts("MODE Q4 PRELOAD CANCEL\r\n");
+                } else if (tune.run) {
                     line_paused = true;
                     q4_motion_stop();
                     ball_balance_set_feedforward(0.0f);
@@ -905,30 +917,25 @@ int main(void)
                      * 每次模式二启动/继续都从零建立实际加速度估计，避免暂停
                      * 前的编码器速度残留被误认为新的启动冲击。
                      */
-                    motion_state_init(&motion);
-                    q4_motion_start(g_ms_ticks);
+                    /* 预置期间底盘必须保持停止，运动计时到真正起步时再清零。 */
+                    stop_line_outputs(&tune);
                     ball_balance_hold_q4(Q4_BALL_TARGET_MM);
                     /*
                      * 与 B15 启动事件同周期置入计划加速度前馈，不等待
                      * 编码器脉冲或下一帧 K230 数据。
                      */
-                    ball_balance_set_feedforward(
+                    ball_balance_set_initial_feedforward(
                         q4_motion_get_start_feedforward_deg());
                     if (!stepper_arm_send_pending_now(g_ms_ticks)) {
-                        q4_motion_stop();
                         ball_balance_stop();
                         mode_started = false;
                         debug_puts("MODE Q4 BLOCK X42S NOT READY\r\n");
                     } else {
                         mode_started = true;
-                        if (line_paused) {
-                            line_paused = false;
-                            debug_puts("MODE Q4 RESUME LINEAR RAMP\r\n");
-                            resume_line_tracking(&tune);
-                        } else {
-                            debug_puts("MODE Q4 START ANGLE FIRST\r\n");
-                            start_line_tracking(&tune);
-                        }
+                        q4_preload_pending = true;
+                        q4_resume_after_preload = line_paused;
+                        q4_preload_start_ms = g_ms_ticks;
+                        debug_puts("MODE Q4 PRELOAD LEAD WAIT\r\n");
                     }
                 }
             } else {
@@ -942,6 +949,33 @@ int main(void)
                     line_paused = false;
                     debug_puts("MODE STEPPER START\r\n");
                     debug_print_stepper_state("STEPPER READY");
+                }
+            }
+        }
+
+        /*
+         * 补偿领先采用非阻塞计时：等待期间通信和X42S服务正常运行，
+         * 但底盘保持停止；计时结束后才启动Q4运动时间轴和循迹。
+         */
+        if (q4_preload_pending) {
+            tune.run = false;
+            tune.line_active = false;
+            left_pwm = 0;
+            right_pwm = 0;
+            motor_stop();
+
+            if ((g_ms_ticks - q4_preload_start_ms) >=
+                Q4_PRELOAD_LEAD_MS) {
+                motion_state_init(&motion);
+                q4_motion_start(g_ms_ticks);
+                q4_preload_pending = false;
+                line_paused = false;
+                if (q4_resume_after_preload) {
+                    debug_puts("MODE Q4 RESUME AFTER PRELOAD\r\n");
+                    resume_line_tracking(&tune);
+                } else {
+                    debug_puts("MODE Q4 START AFTER PRELOAD\r\n");
+                    start_line_tracking(&tune);
                 }
             }
         }
@@ -1028,7 +1062,8 @@ int main(void)
                     debug_print_i32((int32_t)q4_setpoint.elapsed_ms);
                     debug_puts("\r\n");
                 }
-            } else if (app_mode == APP_MODE_Q4_AB) {
+            } else if ((app_mode == APP_MODE_Q4_AB) &&
+                       !q4_preload_pending) {
                 ball_balance_set_feedforward(0.0f);
             }
 

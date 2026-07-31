@@ -44,7 +44,7 @@ static float abs_f32(float value)
  * 物理角正方向统一定义为“车尾合页端高、车头电机端低”。如果实机
  * 第一次测试方向相反，只改 BALL_ACTUATOR_ANGLE_SIGN，不改控制公式。
  */
-static void apply_pipe_command(void)
+static void apply_pipe_command_with_rate(float motor_rate_deg_s)
 {
     float total_angle = g_feedforward_deg + g_feedback_deg;
 
@@ -55,7 +55,12 @@ static void apply_pipe_command(void)
     g_state.theta_deg = total_angle;
     stepper_arm_set_pipe_angle(
         BALL_ACTUATOR_ANGLE_SIGN * total_angle,
-        BALL_THETA_RATE_DEG);
+        motor_rate_deg_s);
+}
+
+static void apply_pipe_command(void)
+{
+    apply_pipe_command_with_rate(BALL_THETA_RATE_DEG);
 }
 
 /**
@@ -126,6 +131,16 @@ void ball_balance_set_feedforward(float pipe_angle_deg)
     if (g_q4_hold_active) {
         /* B15 启动时立即把前馈目标提交给 X42S，不等待下一帧视觉数据。 */
         apply_pipe_command();
+    }
+}
+
+void ball_balance_set_initial_feedforward(float pipe_angle_deg)
+{
+    g_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
+        -Q4_MAX_FEEDFORWARD_DEG, Q4_MAX_FEEDFORWARD_DEG);
+    if (g_q4_hold_active) {
+        /* 启动补偿直接高速到达目标角，正常 PID 接管后仍使用原来的微调速度。 */
+        apply_pipe_command_with_rate(Q4_INITIAL_ANGLE_RATE_DEG_S);
     }
 }
 
@@ -320,6 +335,19 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         float position_output;
         float speed_output;
         float speed_derivative;
+
+        /*
+         * 固定启动倾角期间只更新视觉位置和速度状态，不叠加 PID 输出。
+         * 保持结束后前馈直接归零，稳定版位置/速度 PID 从最新状态接管。
+         */
+        if (abs_f32(g_feedforward_deg) > 0.001f) {
+            g_q4_position_integral = 0.0f;
+            g_q4_speed_integral = 0.0f;
+            g_q4_last_speed_error = 0.0f;
+            g_feedback_deg = 0.0f;
+            apply_pipe_command();
+            return;
+        }
 
         /*
          * 模式二直接对球位置做小角度 PID。速度即位置误差的负导数，

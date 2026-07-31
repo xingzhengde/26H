@@ -54,16 +54,19 @@
 #define Q4_BALL_TARGET_MM        (0.0f)
 #define Q4_EST_CRUISE_SPEED_MPS  (0.248f)
 #define Q4_GRAVITY_MPS2          (9.80665f)
-#define Q4_MAX_FEEDFORWARD_DEG   (0.9f)
+#define Q4_MAX_FEEDFORWARD_DEG   (3.0f)
 /*
  * 编码器首次确认车轮已经运动后立即介入，并在 60ms 内快速渐入。
  * 这样补偿与实车起步接近同步，同时避免直接给水管角度阶跃。
  */
 #define Q4_FEEDFORWARD_ENABLE    (1)
-#define Q4_FEEDFORWARD_FADE_MS   (400U)
-#define Q4_FEEDFORWARD_GAIN      (0.60f)
+#define Q4_INITIAL_ANGLE_DEG     (1.70f)
+/* 启动时固定保持明确的目标倾角；到时直接交给稳定版 PID，不做渐退。 */
+#define Q4_INITIAL_ANGLE_HOLD_MS (200U)
+#define Q4_PRELOAD_LEAD_MS       (200U)
+#define Q4_INITIAL_ANGLE_RATE_DEG_S (240.0f)
 /* 实机确认原移动补偿方向相反：仅翻转加速度前馈，不翻转球位置反馈。 */
-#define Q4_FEEDFORWARD_SIGN      (-1.0f)
+#define Q4_FEEDFORWARD_SIGN      (1.0f)
 #define Q4_ENCODER_METERS_PER_COUNT (0.00003333f)
 #define Q4_ACCEL_LIMIT_MPS2      (0.45f)
 #define Q4_MEASURED_ACCEL_WEIGHT (0.80f)
