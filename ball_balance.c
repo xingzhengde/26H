@@ -13,11 +13,16 @@ static float g_speed_integral;
 static float g_q4_position_integral;
 static float g_q4_speed_integral;
 static float g_q4_last_speed_error;
+static float g_q6_curve_position_integral;
+static float g_q6_curve_speed_integral;
+static float g_q6_curve_last_speed_error;
+static bool g_q6_curve_cascade_active;
 static float g_last_raw_velocity_mm_s;
 static float g_filtered_accel_mm_s2;
 static float g_feedforward_deg;
 static float g_curve_feedforward_deg;
 static float g_feedback_deg;
+static float g_feedback_scale;
 static bool g_q4_hold_active;
 static bool g_q6_hold_active;
 
@@ -85,13 +90,14 @@ static float abs_f32(float value)
  */
 static void apply_pipe_command_with_rate(float motor_rate_deg_s)
 {
+    float applied_feedback_deg = g_feedback_deg * g_feedback_scale;
     float total_angle = g_feedforward_deg + g_curve_feedforward_deg +
-        g_feedback_deg;
+        applied_feedback_deg;
 
     total_angle = clamp_f32_ball(total_angle,
         -BALL_SPEED_MAX_THETA, BALL_SPEED_MAX_THETA);
     g_state.feedforward_deg = g_feedforward_deg + g_curve_feedforward_deg;
-    g_state.feedback_deg = g_feedback_deg;
+    g_state.feedback_deg = applied_feedback_deg;
     g_state.theta_deg = total_angle;
     stepper_arm_set_pipe_angle(
         BALL_ACTUATOR_ANGLE_SIGN * total_angle,
@@ -119,6 +125,10 @@ static void reset_loop_state(void)
     g_q4_position_integral = 0.0f;
     g_q4_speed_integral = 0.0f;
     g_q4_last_speed_error = 0.0f;
+    g_q6_curve_position_integral = 0.0f;
+    g_q6_curve_speed_integral = 0.0f;
+    g_q6_curve_last_speed_error = 0.0f;
+    g_q6_curve_cascade_active = false;
     g_last_raw_velocity_mm_s = 0.0f;
     g_filtered_accel_mm_s2 = 0.0f;
     g_feedback_deg = 0.0f;
@@ -134,6 +144,7 @@ void ball_balance_init(void)
 {
     g_feedforward_deg = 0.0f;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_state.mode = BALL_MODE_IDLE;
@@ -147,6 +158,7 @@ void ball_balance_start_sequence(void)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_SEQ_PLUS;
     g_state.target_mm = BALL_TARGET_PLUS_MM;
     reset_loop_state();
@@ -157,6 +169,7 @@ void ball_balance_hold_target(float target_mm)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -167,6 +180,7 @@ void ball_balance_hold_q4(float target_mm)
     g_q4_hold_active = true;
     g_q6_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -177,6 +191,7 @@ void ball_balance_hold_q6(float target_mm)
     g_q4_hold_active = true;
     g_q6_hold_active = true;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
@@ -196,14 +211,36 @@ void ball_balance_set_feedforward(float pipe_angle_deg)
 
 void ball_balance_set_curve_feedforward(float pipe_angle_deg)
 {
+    bool cascade_active;
+
     if (!g_q6_hold_active) {
         g_curve_feedforward_deg = 0.0f;
+        g_q6_curve_cascade_active = false;
         return;
     }
     g_curve_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
         -Q6_CURVE_FF_MAX_DEG, Q6_CURVE_FF_MAX_DEG);
+    cascade_active = abs_f32(g_curve_feedforward_deg) > 0.02f;
+    if (cascade_active != g_q6_curve_cascade_active) {
+        /* Reset both controllers at curve transitions to avoid stale I terms. */
+        g_q4_position_integral = 0.0f;
+        g_q4_speed_integral = 0.0f;
+        g_q4_last_speed_error = 0.0f;
+        g_q6_curve_position_integral = 0.0f;
+        g_q6_curve_speed_integral = 0.0f;
+        g_q6_curve_last_speed_error = 0.0f;
+        g_q6_curve_cascade_active = cascade_active;
+    }
     /* 弯道前馈独立叠加，不触发启动阶段的 PID 冻结。 */
     apply_pipe_command();
+}
+
+void ball_balance_set_feedback_scale(float scale)
+{
+    g_feedback_scale = clamp_f32_ball(scale, 0.0f, 1.0f);
+    if (g_q4_hold_active) {
+        apply_pipe_command();
+    }
 }
 
 void ball_balance_set_initial_feedforward(float pipe_angle_deg)
@@ -227,6 +264,7 @@ void ball_balance_stop(void)
     g_q6_hold_active = false;
     g_feedforward_deg = 0.0f;
     g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
     reset_loop_state();
     apply_pipe_command();
 }
@@ -414,16 +452,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         float position_output;
         float speed_output;
         float speed_derivative;
-        float pos_kp = pid_cfg->pos_kp;
-        float pos_ki = pid_cfg->pos_ki;
-        float speed_kp = pid_cfg->speed_kp;
-        float speed_ki = pid_cfg->speed_ki;
-        float speed_kd = pid_cfg->speed_kd;
-        float pos_out_max = pid_cfg->pos_out_max_deg;
-        float speed_out_max = pid_cfg->speed_out_max_deg;
-        float pid_max_theta = pid_cfg->max_theta;
         bool q6_curve_control = g_q6_hold_active &&
-            (abs_f32(g_curve_feedforward_deg) > 0.02f);
+            g_q6_curve_cascade_active;
 
         /*
          * 固定启动倾角期间只更新视觉位置和速度状态，不叠加 PID 输出。
@@ -433,20 +463,62 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
             g_q4_position_integral = 0.0f;
             g_q4_speed_integral = 0.0f;
             g_q4_last_speed_error = 0.0f;
+            g_q6_curve_position_integral = 0.0f;
+            g_q6_curve_speed_integral = 0.0f;
+            g_q6_curve_last_speed_error = 0.0f;
             g_feedback_deg = 0.0f;
             apply_pipe_command();
             return;
         }
 
         if (q6_curve_control) {
-            pos_kp *= Q6_CURVE_POS_KP_SCALE;
-            pos_ki *= Q6_CURVE_POS_KI_SCALE;
-            speed_kp *= Q6_CURVE_SPEED_KP_SCALE;
-            speed_ki *= Q6_CURVE_SPEED_KI_SCALE;
-            speed_kd *= Q6_CURVE_SPEED_KD_SCALE;
-            pos_out_max = Q6_CURVE_POS_OUT_MAX_DEG;
-            speed_out_max = Q6_CURVE_SPEED_OUT_MAX_DEG;
-            pid_max_theta = Q6_CURVE_PID_MAX_THETA;
+            float target_velocity_mm_s;
+
+            /* Compensate the measured curve equilibrium bias toward motor end. */
+            pos_error += Q6_CURVE_TARGET_BIAS_MM;
+
+            /* Position outer loop: position error becomes target ball speed. */
+            if (abs_f32(pos_error) <= Q6_CURVE_CASCADE_DEADBAND_MM) {
+                pos_error = 0.0f;
+                g_q6_curve_position_integral *= 0.85f;
+            } else {
+                g_q6_curve_position_integral += pos_error * dt_s;
+                g_q6_curve_position_integral = clamp_f32_ball(
+                    g_q6_curve_position_integral,
+                    -Q6_CURVE_CASCADE_POS_INT_LIMIT,
+                    Q6_CURVE_CASCADE_POS_INT_LIMIT);
+            }
+            target_velocity_mm_s =
+                (Q6_CURVE_CASCADE_POS_KP * pos_error) +
+                (Q6_CURVE_CASCADE_POS_KI *
+                    g_q6_curve_position_integral) -
+                (Q6_CURVE_CASCADE_POS_KD * control_velocity_mm_s);
+            target_velocity_mm_s = clamp_f32_ball(target_velocity_mm_s,
+                -Q6_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S,
+                Q6_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S);
+
+            /* Speed inner loop: target speed becomes the pipe angle command. */
+            speed_error = target_velocity_mm_s - control_velocity_mm_s;
+            g_q6_curve_speed_integral += speed_error * dt_s;
+            g_q6_curve_speed_integral = clamp_f32_ball(
+                g_q6_curve_speed_integral,
+                -Q6_CURVE_CASCADE_SPEED_INT_LIMIT,
+                Q6_CURVE_CASCADE_SPEED_INT_LIMIT);
+            speed_derivative =
+                (speed_error - g_q6_curve_last_speed_error) / dt_s;
+            speed_derivative = clamp_f32_ball(speed_derivative,
+                -pid_cfg->accel_limit, pid_cfg->accel_limit);
+            g_q6_curve_last_speed_error = speed_error;
+            g_feedback_deg = -(
+                (Q6_CURVE_CASCADE_SPEED_KP * speed_error) +
+                (Q6_CURVE_CASCADE_SPEED_KI *
+                    g_q6_curve_speed_integral) +
+                (Q6_CURVE_CASCADE_SPEED_KD * speed_derivative));
+            g_feedback_deg = clamp_f32_ball(g_feedback_deg,
+                -Q6_CURVE_CASCADE_ANGLE_MAX_DEG,
+                Q6_CURVE_CASCADE_ANGLE_MAX_DEG);
+            apply_pipe_command();
+            return;
         }
 
         /*
@@ -466,11 +538,11 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
          * 位置 PID 把球拉回中心；速度 PID 的目标速度固定为 0，专门抑制
          * 球继续滚动。两路先各自限幅再加权，避免视觉跳点独占全部倾角。
          */
-        position_output = (pos_kp * pos_error) +
-            (pos_ki * g_q4_position_integral) -
+        position_output = (pid_cfg->pos_kp * pos_error) +
+            (pid_cfg->pos_ki * g_q4_position_integral) -
             (pid_cfg->pos_kd * control_velocity_mm_s);
         position_output = clamp_f32_ball(position_output,
-            -pos_out_max, pos_out_max);
+            -pid_cfg->pos_out_max_deg, pid_cfg->pos_out_max_deg);
 
         speed_error = -control_velocity_mm_s;
         g_q4_speed_integral += speed_error * dt_s;
@@ -480,16 +552,16 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         speed_derivative = clamp_f32_ball(speed_derivative,
             -pid_cfg->accel_limit, pid_cfg->accel_limit);
         g_q4_last_speed_error = speed_error;
-        speed_output = (speed_kp * speed_error) +
-            (speed_ki * g_q4_speed_integral) +
-            (speed_kd * speed_derivative);
+        speed_output = (pid_cfg->speed_kp * speed_error) +
+            (pid_cfg->speed_ki * g_q4_speed_integral) +
+            (pid_cfg->speed_kd * speed_derivative);
         speed_output = clamp_f32_ball(speed_output,
-            -speed_out_max, speed_out_max);
+            -pid_cfg->speed_out_max_deg, pid_cfg->speed_out_max_deg);
 
         g_feedback_deg = -((pid_cfg->pos_weight * position_output) +
             (pid_cfg->speed_weight * speed_output));
         g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-            -pid_max_theta, pid_max_theta);
+            -pid_cfg->max_theta, pid_cfg->max_theta);
         apply_pipe_command();
         return;
     }

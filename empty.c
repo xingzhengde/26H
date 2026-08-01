@@ -283,6 +283,7 @@ static float q6_curve_feedforward_update(float current_deg,
                                          bool line_valid,
                                          uint32_t now_ms,
                                          bool *curve_active,
+                                         uint32_t *curve_candidate_ms,
                                          uint32_t *curve_enter_ms,
                                          uint32_t *straight_since_ms)
 {
@@ -291,11 +292,22 @@ static float q6_curve_feedforward_update(float current_deg,
         -(int32_t)line_error : (int32_t)line_error;
 
 #if Q6_CURVE_FF_ENABLE
-    if (line_valid && (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
-        if (!*curve_active) {
-            *curve_active = true;
-            *curve_enter_ms = now_ms;
+    if (!*curve_active) {
+        if (line_valid && (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
+            if (*curve_candidate_ms == 0U) {
+                *curve_candidate_ms = now_ms;
+            } else if ((now_ms - *curve_candidate_ms) >=
+                       Q6_CURVE_FF_ENTRY_CONFIRM_MS) {
+                *curve_active = true;
+                *curve_enter_ms = now_ms;
+                *curve_candidate_ms = 0U;
+                *straight_since_ms = 0U;
+            }
+        } else {
+            *curve_candidate_ms = 0U;
         }
+    } else if (line_valid &&
+               (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
         *straight_since_ms = 0U;
     } else if (*curve_active && line_valid &&
                ((now_ms - *curve_enter_ms) >=
@@ -328,6 +340,7 @@ static float q6_curve_feedforward_update(float current_deg,
     (void)error_abs;
     (void)now_ms;
     (void)curve_active;
+    (void)curve_candidate_ms;
     (void)curve_enter_ms;
     (void)straight_since_ms;
 #endif
@@ -764,6 +777,7 @@ int main(void)
     uint32_t q4_preload_start_ms = 0U;
     float q6_curve_feedforward_deg = 0.0f;
     bool q6_curve_active = false;
+    uint32_t q6_curve_candidate_ms = 0U;
     uint32_t q6_curve_enter_ms = 0U;
     uint32_t q6_straight_since_ms = 0U;
     bool x42s_version_reported = false;
@@ -971,6 +985,7 @@ int main(void)
             q4_preload_pending = false;
             q6_curve_feedforward_deg = 0.0f;
             q6_curve_active = false;
+            q6_curve_candidate_ms = 0U;
             q6_curve_enter_ms = 0U;
             q6_straight_since_ms = 0U;
             mode_started = false;
@@ -1040,9 +1055,11 @@ int main(void)
                     if (app_mode == APP_MODE_Q6_ARBITRARY) {
                         q6_curve_feedforward_deg = 0.0f;
                         q6_curve_active = false;
+                        q6_curve_candidate_ms = 0U;
                         q6_curve_enter_ms = 0U;
                         q6_straight_since_ms = 0U;
                         ball_balance_set_curve_feedforward(0.0f);
+                        ball_balance_set_feedback_scale(1.0f);
                     }
                     debug_puts("MODE Q4 PAUSE\r\n");
                     pause_line_tracking(&tune);
@@ -1217,6 +1234,19 @@ int main(void)
                 drive_ramp_ratio = q4_setpoint.ramp_ratio;
                 ball_balance_set_feedforward(
                     q4_setpoint.pipe_feedforward_deg);
+                if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                    float feedback_scale = 0.0f;
+
+                    if (q4_setpoint.elapsed_ms >
+                        Q6_INITIAL_ANGLE_HOLD_MS) {
+                        feedback_scale = (float)(
+                            q4_setpoint.elapsed_ms -
+                            Q6_INITIAL_ANGLE_HOLD_MS) /
+                            (float)Q6_BALL_FEEDBACK_BLEND_MS;
+                    }
+                    ball_balance_set_feedback_scale(clamp_f32(
+                        feedback_scale, 0.0f, 1.0f));
+                }
 
                 if (q4_setpoint.passed_b_time &&
                     !q4_b_time_reported) {
@@ -1270,12 +1300,23 @@ int main(void)
                 tune.line_valid = tracker.valid;
 
                 if (app_mode == APP_MODE_Q6_ARBITRARY) {
-                    q6_curve_feedforward_deg =
-                        q6_curve_feedforward_update(
-                            q6_curve_feedforward_deg,
-                            tracker.error, tracker.valid, g_ms_ticks,
-                            &q6_curve_active, &q6_curve_enter_ms,
-                            &q6_straight_since_ms);
+                    if (q4_setpoint.elapsed_ms >=
+                        Q6_CURVE_ARM_DELAY_MS) {
+                        q6_curve_feedforward_deg =
+                            q6_curve_feedforward_update(
+                                q6_curve_feedforward_deg,
+                                tracker.error, tracker.valid, g_ms_ticks,
+                                &q6_curve_active,
+                                &q6_curve_candidate_ms,
+                                &q6_curve_enter_ms,
+                                &q6_straight_since_ms);
+                    } else {
+                        q6_curve_feedforward_deg = 0.0f;
+                        q6_curve_active = false;
+                        q6_curve_candidate_ms = 0U;
+                        q6_curve_enter_ms = 0U;
+                        q6_straight_since_ms = 0U;
+                    }
                     ball_balance_set_curve_feedforward(
                         q6_curve_feedforward_deg);
                 }

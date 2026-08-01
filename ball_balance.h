@@ -34,6 +34,7 @@ void ball_balance_hold_q4(float target_mm);
 void ball_balance_hold_q6(float target_mm);
 void ball_balance_set_feedforward(float pipe_angle_deg);
 void ball_balance_set_curve_feedforward(float pipe_angle_deg);
+void ball_balance_set_feedback_scale(float scale);
 void ball_balance_set_initial_feedforward(float pipe_angle_deg);
 void ball_balance_stop(void);
 void ball_balance_update(uint32_t now_ms, bool sample_ok,
