@@ -162,6 +162,21 @@
 /* +x points to the hinge end; shift only the mode-3 curve target that way. */
 #define Q6_CURVE_TARGET_BIAS_MM    (5.0f)
 
+/* Mode-3 straight cascade PID, independent from the proven curve settings. */
+#define Q6_STRAIGHT_CASCADE_POS_KP (1.10f)
+#define Q6_STRAIGHT_CASCADE_POS_KI (0.010f)
+#define Q6_STRAIGHT_CASCADE_POS_KD (0.08f)
+#define Q6_STRAIGHT_CASCADE_POS_INT_LIMIT (60.0f)
+#define Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S (40.0f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KP (0.035f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KI (0.0008f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KD (0.00010f)
+#define Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT (80.0f)
+#define Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.50f)
+#define Q6_STRAIGHT_CASCADE_DEADBAND_MM (1.5f)
+/* +x is the hinge end; compensate mode-3 straight equilibrium only. */
+#define Q6_STRAIGHT_TARGET_BIAS_MM (8.0f)
+
 #define Q6_BALL_POS_KP            (0.080f)
 #define Q6_BALL_POS_KI            (0.004f)
 #define Q6_BALL_POS_KD            (0.000f)
