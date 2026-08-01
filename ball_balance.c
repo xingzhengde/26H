@@ -35,6 +35,17 @@ static float g_q6_curve_target_bias_mm;
 static float g_q7_straight_target_bias_mm;
 static float g_q7_curve_target_bias_mm;
 
+typedef enum {
+    Q67_STICTION_IDLE = 0,
+    Q67_STICTION_QUALIFY,
+    Q67_STICTION_PULSE,
+    Q67_STICTION_COOLDOWN
+} Q67StictionPhase;
+
+static Q67StictionPhase g_q67_stiction_phase;
+static uint32_t g_q67_stiction_phase_start_ms;
+static int8_t g_q67_stiction_error_sign;
+
 /* Mode-5 fixed sequence is private and never selected by modes 1-4. */
 typedef enum {
     Q3_MODE5_PHASE_IDLE = 0,
@@ -151,6 +162,85 @@ static void apply_pipe_command_with_rate(float motor_rate_deg_s)
     stepper_arm_set_pipe_angle(
         BALL_ACTUATOR_ANGLE_SIGN * total_angle,
         motor_rate_deg_s);
+}
+
+static void reset_q67_stiction_state(void)
+{
+    g_q67_stiction_phase = Q67_STICTION_IDLE;
+    g_q67_stiction_phase_start_ms = 0U;
+    g_q67_stiction_error_sign = 0;
+}
+
+/**
+ * @brief 给模式三/四的串级PID叠加短时破静摩擦脉冲。
+ *
+ * 只有误差持续存在且小球速度很低时才触发。脉冲方向始终与PID回目标方向
+ * 一致；一旦小球开始移动立即进入冷却，避免固定增益造成穿越中心后摆动。
+ */
+static float apply_q67_stiction_boost(uint32_t now_ms, float position_error_mm,
+                                      float velocity_mm_s,
+                                      float feedback_deg, float angle_max_deg)
+{
+    bool q7 = g_q7_hold_active;
+    bool enabled = q7 ? (Q7_STICTION_ENABLE != 0) :
+                        (Q6_STICTION_ENABLE != 0);
+    float error_enter_mm = q7 ? Q7_STICTION_ERROR_ENTER_MM :
+                                Q6_STICTION_ERROR_ENTER_MM;
+    float error_exit_mm = q7 ? Q7_STICTION_ERROR_EXIT_MM :
+                               Q6_STICTION_ERROR_EXIT_MM;
+    float speed_enter_mm_s = q7 ? Q7_STICTION_SPEED_ENTER_MM_S :
+                                  Q6_STICTION_SPEED_ENTER_MM_S;
+    float speed_release_mm_s = q7 ? Q7_STICTION_SPEED_RELEASE_MM_S :
+                                    Q6_STICTION_SPEED_RELEASE_MM_S;
+    uint32_t stable_ms = q7 ? Q7_STICTION_STABLE_MS :
+                              Q6_STICTION_STABLE_MS;
+    uint32_t pulse_ms = q7 ? Q7_STICTION_PULSE_MS :
+                             Q6_STICTION_PULSE_MS;
+    uint32_t cooldown_ms = q7 ? Q7_STICTION_COOLDOWN_MS :
+                                Q6_STICTION_COOLDOWN_MS;
+    float boost_deg = q7 ? Q7_STICTION_BOOST_DEG :
+                           Q6_STICTION_BOOST_DEG;
+    float abs_error_mm = abs_f32(position_error_mm);
+    float abs_velocity_mm_s = abs_f32(velocity_mm_s);
+    int8_t error_sign = (position_error_mm > 0.0f) ? 1 : -1;
+    bool stuck = (abs_error_mm >= error_enter_mm) &&
+                 (abs_velocity_mm_s <= speed_enter_mm_s);
+
+    if (!enabled || !g_q6_hold_active || (g_feedback_scale < 0.95f) ||
+        (abs_error_mm <= error_exit_mm)) {
+        reset_q67_stiction_state();
+        return feedback_deg;
+    }
+
+    if (g_q67_stiction_phase == Q67_STICTION_IDLE) {
+        if (stuck) {
+            g_q67_stiction_phase = Q67_STICTION_QUALIFY;
+            g_q67_stiction_phase_start_ms = now_ms;
+            g_q67_stiction_error_sign = error_sign;
+        }
+    } else if (g_q67_stiction_phase == Q67_STICTION_QUALIFY) {
+        if (!stuck || (error_sign != g_q67_stiction_error_sign)) {
+            reset_q67_stiction_state();
+        } else if ((now_ms - g_q67_stiction_phase_start_ms) >= stable_ms) {
+            g_q67_stiction_phase = Q67_STICTION_PULSE;
+            g_q67_stiction_phase_start_ms = now_ms;
+        }
+    } else if (g_q67_stiction_phase == Q67_STICTION_PULSE) {
+        if ((error_sign != g_q67_stiction_error_sign) ||
+            (abs_velocity_mm_s >= speed_release_mm_s) ||
+            ((now_ms - g_q67_stiction_phase_start_ms) >= pulse_ms)) {
+            g_q67_stiction_phase = Q67_STICTION_COOLDOWN;
+            g_q67_stiction_phase_start_ms = now_ms;
+        }
+    } else if ((now_ms - g_q67_stiction_phase_start_ms) >= cooldown_ms) {
+        reset_q67_stiction_state();
+    }
+
+    if (g_q67_stiction_phase == Q67_STICTION_PULSE) {
+        /* Cascade feedback sign is opposite to position-error sign. */
+        feedback_deg -= (float)g_q67_stiction_error_sign * boost_deg;
+    }
+    return clamp_f32_ball(feedback_deg, -angle_max_deg, angle_max_deg);
 }
 
 static void apply_pipe_command(void)
@@ -279,6 +369,7 @@ static void service_q3_mode5_timeline(uint32_t now_ms)
  */
 static void reset_loop_state(void)
 {
+    reset_q67_stiction_state();
     g_last_sample_timestamp_ms = 0U;
     g_last_frame_id = 0U;
     g_last_frame_time_ms = 0U;
@@ -479,6 +570,7 @@ void ball_balance_set_curve_feedforward(float pipe_angle_deg)
         g_q6_straight_position_integral = 0.0f;
         g_q6_straight_speed_integral = 0.0f;
         g_q6_straight_last_speed_error = 0.0f;
+        reset_q67_stiction_state();
         g_q6_curve_cascade_active = cascade_active;
     }
     /* 弯道前馈独立叠加，不触发启动阶段的 PID 冻结。 */
@@ -586,6 +678,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
      * 此时撤掉闭环修正但保留小车加速度前馈，避免继续沿错误方向积分。
      */
     if (!sample_ok || (sample == 0)) {
+        reset_q67_stiction_state();
         g_last_sample_timestamp_ms = 0U;
         g_have_frame_meta = false;
         g_speed_integral = 0.0f;
@@ -849,8 +942,9 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 (speed_ki *
                     g_q6_curve_speed_integral) +
                 (speed_kd * speed_derivative));
-            g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-                -angle_max, angle_max);
+            g_feedback_deg = apply_q67_stiction_boost(
+                now_ms, pos_error, control_velocity_mm_s,
+                g_feedback_deg, angle_max);
             apply_pipe_command();
             return;
         }
@@ -925,8 +1019,9 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 (speed_ki *
                     g_q6_straight_speed_integral) +
                 (speed_kd * speed_derivative));
-            g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-                -angle_max, angle_max);
+            g_feedback_deg = apply_q67_stiction_boost(
+                now_ms, pos_error, control_velocity_mm_s,
+                g_feedback_deg, angle_max);
             apply_pipe_command();
             return;
         }

@@ -177,6 +177,17 @@
 /* +x is the hinge end; compensate mode-3 straight equilibrium only. */
 #define Q6_STRAIGHT_TARGET_BIAS_MM (8.0f)
 
+/* Mode-3-only static-friction breakaway pulse near the target. */
+#define Q6_STICTION_ENABLE             (1)
+#define Q6_STICTION_ERROR_ENTER_MM     (10.0f)
+#define Q6_STICTION_ERROR_EXIT_MM      (5.0f)
+#define Q6_STICTION_SPEED_ENTER_MM_S   (8.0f)
+#define Q6_STICTION_SPEED_RELEASE_MM_S (20.0f)
+#define Q6_STICTION_STABLE_MS          (300U)
+#define Q6_STICTION_PULSE_MS           (180U)
+#define Q6_STICTION_COOLDOWN_MS        (300U)
+#define Q6_STICTION_BOOST_DEG          (0.15f)
+
 #define Q6_BALL_POS_KP            (0.080f)
 #define Q6_BALL_POS_KI            (0.004f)
 #define Q6_BALL_POS_KD            (0.000f)
@@ -277,6 +288,17 @@
 #define Q7_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.50f)
 #define Q7_STRAIGHT_CASCADE_DEADBAND_MM (1.5f)
 #define Q7_STRAIGHT_TARGET_BIAS_MM (13.0f)
+
+/* Mode-4 copy: independent macros allow later mode-specific tuning. */
+#define Q7_STICTION_ENABLE             (1)
+#define Q7_STICTION_ERROR_ENTER_MM     (10.0f)
+#define Q7_STICTION_ERROR_EXIT_MM      (5.0f)
+#define Q7_STICTION_SPEED_ENTER_MM_S   (8.0f)
+#define Q7_STICTION_SPEED_RELEASE_MM_S (20.0f)
+#define Q7_STICTION_STABLE_MS          (300U)
+#define Q7_STICTION_PULSE_MS           (180U)
+#define Q7_STICTION_COOLDOWN_MS        (300U)
+#define Q7_STICTION_BOOST_DEG          (0.15f)
 
 /* State-7 LCD target-bias tuning envelope; +x points to hinge end. */
 #define Q67_TARGET_BIAS_TUNE_MIN_MM (-30.0f)
