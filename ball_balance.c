@@ -29,6 +29,26 @@ static float g_feedback_scale;
 static bool g_q4_hold_active;
 static bool g_q6_hold_active;
 static bool g_q7_hold_active;
+static bool g_q3_mode5_active;
+static float g_q6_straight_target_bias_mm;
+static float g_q6_curve_target_bias_mm;
+static float g_q7_straight_target_bias_mm;
+static float g_q7_curve_target_bias_mm;
+
+/* Mode-5 fixed sequence is private and never selected by modes 1-4. */
+typedef enum {
+    Q3_MODE5_PHASE_IDLE = 0,
+    Q3_MODE5_PHASE_OUT_ACCEL,
+    Q3_MODE5_PHASE_TRANSFER,
+    Q3_MODE5_PHASE_FINAL_BRAKE,
+    Q3_MODE5_PHASE_HOLD_MINUS
+} Q3Mode5Phase;
+
+static Q3Mode5Phase g_q3_mode5_phase;
+static uint32_t g_q3_mode5_phase_start_ms;
+static float g_q3_mode5_hold_integral_deg;
+static Q3OpenLoopParams g_q3_mode5_pending_params;
+static Q3OpenLoopParams g_q3_mode5_run_params;
 
 typedef struct {
     float pos_kp, pos_ki, pos_kd, pos_weight;
@@ -80,6 +100,18 @@ static const BallPidConfig g_q7_pid = {
     Q7_BALL_SPEED_OUT_MAX_DEG, Q7_BALL_PID_MAX_THETA
 };
 
+static const BallPidConfig g_q3_mode5_pid = {
+    Q3_MODE5_HOLD_KP_DEG_PER_MM, Q3_MODE5_HOLD_KI_DEG_PER_MM_S,
+    Q3_MODE5_HOLD_KD_DEG_PER_MM_S, 1.0f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, Q3_MODE5_HOLD_INT_MAX_ANGLE_DEG,
+    Q3_MODE5_ACCEL_LIMIT_MM_S2, Q3_MODE5_POSITION_FILTER_NEW,
+    Q3_MODE5_VELOCITY_FILTER_NEW, Q3_MODE5_ACCEL_FILTER_NEW,
+    0U, 0U, 0U, 0.0f, 0.0f,
+    Q3_MODE5_HOLD_MAX_ANGLE_DEG, Q3_MODE5_HOLD_MAX_ANGLE_DEG,
+    Q3_MODE5_HOLD_MAX_ANGLE_DEG
+};
+
 /**
  * @brief 浮点限幅，防止视觉异常值或积分累积产生危险倾角。
  */
@@ -127,6 +159,120 @@ static void apply_pipe_command(void)
 }
 
 /**
+ * @brief 清除模式五私有时序，防止切换到其它模式后残留固定倾角。
+ */
+static void reset_q3_mode5_state(void)
+{
+    g_q3_mode5_active = false;
+    g_q3_mode5_phase = Q3_MODE5_PHASE_IDLE;
+    g_q3_mode5_phase_start_ms = 0U;
+    g_q3_mode5_hold_integral_deg = 0.0f;
+}
+
+static void load_default_q3_mode5_params(void)
+{
+    g_q3_mode5_pending_params.angle_deg[0] = Q3_MODE5_OUT_ACCEL_ANGLE_DEG;
+    g_q3_mode5_pending_params.time_ms[0] = Q3_MODE5_OUT_ACCEL_TIME_MS;
+    g_q3_mode5_pending_params.angle_deg[1] = Q3_MODE5_TRANSFER_ANGLE_DEG;
+    g_q3_mode5_pending_params.time_ms[1] = Q3_MODE5_TRANSFER_TIME_MS;
+    g_q3_mode5_pending_params.angle_deg[2] = Q3_MODE5_FINAL_BRAKE_ANGLE_DEG;
+    g_q3_mode5_pending_params.time_ms[2] = Q3_MODE5_FINAL_BRAKE_TIME_MS;
+    g_q3_mode5_run_params = g_q3_mode5_pending_params;
+}
+
+bool ball_balance_set_q3_open_loop_params(const Q3OpenLoopParams *params)
+{
+    uint8_t stage;
+    uint32_t total_ms = 0U;
+
+    if ((params == 0) || g_q3_mode5_active) {
+        return false;
+    }
+    for (stage = 0U; stage < 3U; stage++) {
+        if ((params->angle_deg[stage] < Q3_MODE5_TUNE_ANGLE_MIN_DEG) ||
+            (params->angle_deg[stage] > Q3_MODE5_TUNE_ANGLE_MAX_DEG) ||
+            (params->time_ms[stage] < Q3_MODE5_TUNE_TIME_MIN_MS) ||
+            (params->time_ms[stage] > Q3_MODE5_TUNE_TIME_MAX_MS)) {
+            return false;
+        }
+        total_ms += params->time_ms[stage];
+    }
+    if (total_ms > Q3_MODE5_TUNE_TOTAL_MAX_MS) {
+        return false;
+    }
+    g_q3_mode5_pending_params = *params;
+    return true;
+}
+
+/**
+ * @brief 进入模式五的一段固定轨迹，并立即把绝对位置帧发给X42S。
+ *
+ * 参考工程的逻辑角先乘模式五私有方向映射，不修改全局执行机构方向，
+ * 因此模式二、三、四的倾角方向和参数均保持原样。
+ */
+static bool enter_q3_mode5_phase(Q3Mode5Phase phase, uint32_t now_ms)
+{
+    float reference_angle_deg = 0.0f;
+
+    g_q3_mode5_phase = phase;
+    g_q3_mode5_phase_start_ms = now_ms;
+    g_feedback_deg = 0.0f;
+    g_speed_integral = 0.0f;
+
+    switch (phase) {
+    case Q3_MODE5_PHASE_OUT_ACCEL:
+        g_state.target_mm = Q3_MODE5_TARGET_PLUS_MM;
+        reference_angle_deg = g_q3_mode5_run_params.angle_deg[0];
+        break;
+    case Q3_MODE5_PHASE_TRANSFER:
+        g_state.target_mm = Q3_MODE5_TARGET_MINUS_MM;
+        reference_angle_deg = g_q3_mode5_run_params.angle_deg[1];
+        break;
+    case Q3_MODE5_PHASE_FINAL_BRAKE:
+        g_state.target_mm = Q3_MODE5_TARGET_MINUS_MM;
+        reference_angle_deg = g_q3_mode5_run_params.angle_deg[2];
+        break;
+    case Q3_MODE5_PHASE_HOLD_MINUS:
+        g_state.target_mm = Q3_MODE5_TARGET_MINUS_MM;
+        g_q3_mode5_hold_integral_deg = 0.0f;
+        reference_angle_deg = 0.0f;
+        break;
+    default:
+        g_state.target_mm = 0.0f;
+        reference_angle_deg = 0.0f;
+        break;
+    }
+
+    g_feedforward_deg = Q3_MODE5_REFERENCE_ANGLE_SIGN *
+        reference_angle_deg;
+    apply_pipe_command_with_rate(Q3_MODE5_OPEN_LOOP_MOTOR_DPS);
+    return stepper_arm_send_pending_now(now_ms);
+}
+
+/**
+ * @brief 按参考工程的800/1600/450 ms固定时序推进模式五。
+ */
+static void service_q3_mode5_timeline(uint32_t now_ms)
+{
+    uint32_t elapsed_ms;
+
+    if (!g_q3_mode5_active) {
+        return;
+    }
+    elapsed_ms = now_ms - g_q3_mode5_phase_start_ms;
+    if ((g_q3_mode5_phase == Q3_MODE5_PHASE_OUT_ACCEL) &&
+        (elapsed_ms >= g_q3_mode5_run_params.time_ms[0])) {
+        (void)enter_q3_mode5_phase(Q3_MODE5_PHASE_TRANSFER, now_ms);
+    } else if ((g_q3_mode5_phase == Q3_MODE5_PHASE_TRANSFER) &&
+               (elapsed_ms >= g_q3_mode5_run_params.time_ms[1])) {
+        (void)enter_q3_mode5_phase(Q3_MODE5_PHASE_FINAL_BRAKE, now_ms);
+    } else if ((g_q3_mode5_phase == Q3_MODE5_PHASE_FINAL_BRAKE) &&
+               (elapsed_ms >= g_q3_mode5_run_params.time_ms[2])) {
+        (void)enter_q3_mode5_phase(Q3_MODE5_PHASE_HOLD_MINUS, now_ms);
+    }
+}
+
+/**
  * @brief 清除与一次控制任务相关的滤波和积分状态。
  *
  * 每次切换目标都重新初始化，防止上一任务的速度积分把球推向端部。
@@ -168,6 +314,12 @@ void ball_balance_init(void)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_q7_hold_active = false;
+    g_q6_straight_target_bias_mm = Q6_STRAIGHT_TARGET_BIAS_MM;
+    g_q6_curve_target_bias_mm = Q6_CURVE_TARGET_BIAS_MM;
+    g_q7_straight_target_bias_mm = Q7_STRAIGHT_TARGET_BIAS_MM;
+    g_q7_curve_target_bias_mm = Q7_CURVE_TARGET_BIAS_MM;
+    load_default_q3_mode5_params();
+    reset_q3_mode5_state();
     g_state.mode = BALL_MODE_IDLE;
     g_state.target_mm = 0.0f;
     g_state.sample_ok = false;
@@ -179,6 +331,7 @@ void ball_balance_start_sequence(void)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_q7_hold_active = false;
+    reset_q3_mode5_state();
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_SEQ_PLUS;
@@ -191,6 +344,7 @@ void ball_balance_hold_target(float target_mm)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_q7_hold_active = false;
+    reset_q3_mode5_state();
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -203,6 +357,7 @@ void ball_balance_hold_q4(float target_mm)
     g_q4_hold_active = true;
     g_q6_hold_active = false;
     g_q7_hold_active = false;
+    reset_q3_mode5_state();
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -210,11 +365,35 @@ void ball_balance_hold_q4(float target_mm)
     reset_loop_state();
 }
 
+bool ball_balance_set_q67_target_biases(float q6_straight_mm,
+                                        float q6_curve_mm,
+                                        float q7_straight_mm,
+                                        float q7_curve_mm)
+{
+    if (g_q6_hold_active || g_q7_hold_active ||
+        (q6_straight_mm < Q67_TARGET_BIAS_TUNE_MIN_MM) ||
+        (q6_straight_mm > Q67_TARGET_BIAS_TUNE_MAX_MM) ||
+        (q6_curve_mm < Q67_TARGET_BIAS_TUNE_MIN_MM) ||
+        (q6_curve_mm > Q67_TARGET_BIAS_TUNE_MAX_MM) ||
+        (q7_straight_mm < Q67_TARGET_BIAS_TUNE_MIN_MM) ||
+        (q7_straight_mm > Q67_TARGET_BIAS_TUNE_MAX_MM) ||
+        (q7_curve_mm < Q67_TARGET_BIAS_TUNE_MIN_MM) ||
+        (q7_curve_mm > Q67_TARGET_BIAS_TUNE_MAX_MM)) {
+        return false;
+    }
+    g_q6_straight_target_bias_mm = q6_straight_mm;
+    g_q6_curve_target_bias_mm = q6_curve_mm;
+    g_q7_straight_target_bias_mm = q7_straight_mm;
+    g_q7_curve_target_bias_mm = q7_curve_mm;
+    return true;
+}
+
 void ball_balance_hold_q6(float target_mm)
 {
     g_q4_hold_active = true;
     g_q6_hold_active = true;
     g_q7_hold_active = false;
+    reset_q3_mode5_state();
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -227,11 +406,37 @@ void ball_balance_hold_q7(float target_mm)
     g_q4_hold_active = true;
     g_q6_hold_active = true;
     g_q7_hold_active = true;
+    reset_q3_mode5_state();
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
     g_state.target_mm = target_mm;
     reset_loop_state();
+}
+
+bool ball_balance_start_q3(uint32_t now_ms)
+{
+    bool command_sent;
+
+    g_q4_hold_active = false;
+    g_q6_hold_active = false;
+    g_q7_hold_active = false;
+    /* Freeze the six LCD values for this complete three-stage run. */
+    g_q3_mode5_run_params = g_q3_mode5_pending_params;
+    g_q3_mode5_active = true;
+    g_feedforward_deg = 0.0f;
+    g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 1.0f;
+    g_state.mode = BALL_MODE_HOLD_TARGET;
+    g_state.target_mm = Q3_MODE5_TARGET_PLUS_MM;
+    reset_loop_state();
+    command_sent = enter_q3_mode5_phase(
+        Q3_MODE5_PHASE_OUT_ACCEL, now_ms);
+    if (!command_sent) {
+        ball_balance_stop();
+        return false;
+    }
+    return true;
 }
 
 void ball_balance_set_feedforward(float pipe_angle_deg)
@@ -310,6 +515,7 @@ void ball_balance_stop(void)
     g_q4_hold_active = false;
     g_q6_hold_active = false;
     g_q7_hold_active = false;
+    reset_q3_mode5_state();
     g_feedforward_deg = 0.0f;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
@@ -362,15 +568,18 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     float target_velocity;
     float speed_error;
     uint32_t sample_dt_ms;
-    const BallPidConfig *pid_cfg = g_q7_hold_active ? &g_q7_pid :
-        (g_q6_hold_active ? &g_q6_pid : &g_q4_pid);
+    const BallPidConfig *pid_cfg = g_q3_mode5_active ? &g_q3_mode5_pid :
+        (g_q7_hold_active ? &g_q7_pid :
+         (g_q6_hold_active ? &g_q6_pid : &g_q4_pid));
 
-    (void)now_ms;
     g_state.sample_ok = sample_ok;
     if ((g_state.mode == BALL_MODE_IDLE) ||
         (g_state.mode == BALL_MODE_DONE)) {
         return;
     }
+
+    /* M5固定轨迹只依赖毫秒时基，不等待K230目标切换或新视觉帧。 */
+    service_q3_mode5_timeline(now_ms);
 
     /*
      * k230_ball_get_sample() 在数据超过 180ms 或置信度不足时返回 false。
@@ -385,6 +594,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         g_q4_last_speed_error = 0.0f;
         g_last_raw_velocity_mm_s = 0.0f;
         g_filtered_accel_mm_s2 = 0.0f;
+        g_q3_mode5_hold_integral_deg = 0.0f;
         g_feedback_deg = 0.0f;
         g_state.velocity_mm_s = 0.0f;
         apply_pipe_command();
@@ -440,6 +650,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
         g_q4_last_speed_error = 0.0f;
         g_last_raw_velocity_mm_s = 0.0f;
         g_filtered_accel_mm_s2 = 0.0f;
+        g_q3_mode5_hold_integral_deg = 0.0f;
         g_feedback_deg = 0.0f;
         apply_pipe_command();
         return;
@@ -496,6 +707,53 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     control_position_mm = g_state.position_mm + predicted_position_delta;
     control_velocity_mm_s = g_state.velocity_mm_s + predicted_speed_delta;
     pos_error = g_state.target_mm - control_position_mm;
+
+    if (g_q3_mode5_active) {
+        float hold_error_mm;
+        float reference_hold_angle_deg;
+
+        if ((g_q3_mode5_phase != Q3_MODE5_PHASE_HOLD_MINUS) ||
+            (Q3_MODE5_FINAL_PID_ENABLE == 0)) {
+            /*
+             * 纯开环调参版：前三段只执行固定角度；第三段结束后
+             * enter_q3_mode5_phase()已把前馈清零，此处继续强制反馈为零。
+             * K230位置/速度仍更新，但绝不会转化为步进电机角度。
+             */
+            g_feedback_deg = 0.0f;
+            apply_pipe_command_with_rate(Q3_MODE5_OPEN_LOOP_MOTOR_DPS);
+            return;
+        }
+
+        /*
+         * 固定三段结束后才接入参考项目的最终位置PD。积分只在目标附近
+         * 工作且直接按角度限幅，防止再次形成-4 cm到-7 cm的来回摆动。
+         */
+        hold_error_mm = Q3_MODE5_TARGET_MINUS_MM - g_state.position_mm;
+        if (abs_f32(hold_error_mm) <= Q3_MODE5_HOLD_INTEGRAL_ZONE_MM) {
+            g_q3_mode5_hold_integral_deg +=
+                Q3_MODE5_HOLD_KI_DEG_PER_MM_S * hold_error_mm * dt_s;
+            g_q3_mode5_hold_integral_deg = clamp_f32_ball(
+                g_q3_mode5_hold_integral_deg,
+                -Q3_MODE5_HOLD_INT_MAX_ANGLE_DEG,
+                Q3_MODE5_HOLD_INT_MAX_ANGLE_DEG);
+        } else {
+            g_q3_mode5_hold_integral_deg = 0.0f;
+        }
+        reference_hold_angle_deg =
+            (Q3_MODE5_HOLD_KP_DEG_PER_MM * hold_error_mm) +
+            g_q3_mode5_hold_integral_deg -
+            (Q3_MODE5_HOLD_KD_DEG_PER_MM_S * g_state.velocity_mm_s);
+        reference_hold_angle_deg = clamp_f32_ball(
+            reference_hold_angle_deg,
+            -Q3_MODE5_HOLD_MAX_ANGLE_DEG,
+            Q3_MODE5_HOLD_MAX_ANGLE_DEG);
+        g_feedforward_deg = 0.0f;
+        g_feedback_deg = Q3_MODE5_REFERENCE_ANGLE_SIGN *
+            reference_hold_angle_deg;
+        apply_pipe_command_with_rate(Q3_MODE5_HOLD_MOTOR_DPS);
+        return;
+    }
+
     if (g_q4_hold_active) {
         float position_output;
         float speed_output;
@@ -552,7 +810,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 Q7_CURVE_CASCADE_DEADBAND_MM :
                 Q6_CURVE_CASCADE_DEADBAND_MM;
             float target_bias_mm = g_q7_hold_active ?
-                Q7_CURVE_TARGET_BIAS_MM : Q6_CURVE_TARGET_BIAS_MM;
+                g_q7_curve_target_bias_mm : g_q6_curve_target_bias_mm;
 
             /* Compensate the measured curve equilibrium bias toward motor end. */
             pos_error += target_bias_mm;
@@ -627,7 +885,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 Q7_STRAIGHT_CASCADE_DEADBAND_MM :
                 Q6_STRAIGHT_CASCADE_DEADBAND_MM;
             float target_bias_mm = g_q7_hold_active ?
-                Q7_STRAIGHT_TARGET_BIAS_MM : Q6_STRAIGHT_TARGET_BIAS_MM;
+                g_q7_straight_target_bias_mm :
+                g_q6_straight_target_bias_mm;
 
             /* Shift only the mode-3 straight target toward the hinge end. */
             pos_error += target_bias_mm;
@@ -742,4 +1001,19 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
 BallBalanceState ball_balance_get_state(void)
 {
     return g_state;
+}
+
+uint8_t ball_balance_get_q3_report_phase(void)
+{
+    switch (g_q3_mode5_phase) {
+    case Q3_MODE5_PHASE_OUT_ACCEL:
+        return 1U; /* K230 SEQ_TO_POSITIVE */
+    case Q3_MODE5_PHASE_TRANSFER:
+    case Q3_MODE5_PHASE_FINAL_BRAKE:
+        return 2U; /* K230 SEQ_TO_NEGATIVE */
+    case Q3_MODE5_PHASE_HOLD_MINUS:
+        return 3U; /* K230 SEQ_HOLD_NEGATIVE */
+    default:
+        return 0U; /* K230 SEQ_WAIT_CENTER */
+    }
 }

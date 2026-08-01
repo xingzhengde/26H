@@ -25,6 +25,7 @@ typedef enum {
     APP_MODE_Q4_AB,
     APP_MODE_Q6_ARBITRARY,
     APP_MODE_Q7_ARBITRARY,
+    APP_MODE_Q3_SEQUENCE,
     APP_MODE_COUNT,
     /*
      * 保留步进机构调试代码，但不放入 B5 的比赛模式循环。
@@ -437,6 +438,8 @@ static const char *app_mode_name(AppMode mode)
         return "M3 Q6 CENTER";
     case APP_MODE_Q7_ARBITRARY:
         return "M4 Q7 ANY";
+    case APP_MODE_Q3_SEQUENCE:
+        return "M5 Q3 SEQ";
     case APP_MODE_STEPPER_MANUAL:
         return "M5 STEPPER";
     default:
@@ -817,6 +820,10 @@ int main(void)
     bool ball_sample_ok = false;
     K230ControlState k230_control = {0};
     bool k230_control_ok = false;
+    K230Q3TuneParams k230_q3_tune = {0};
+    uint32_t q3_tune_applied_revision = 0U;
+    K230StartAngleParams k230_start_angles = {0};
+    uint32_t start_angles_applied_revision = 0U;
     Q4MotionSetpoint q4_setpoint;
     bool q4_b_time_reported = false;
     bool q4_preload_pending = false;
@@ -827,6 +834,7 @@ int main(void)
     uint32_t q6_curve_candidate_ms = 0U;
     uint32_t q6_curve_enter_ms = 0U;
     uint32_t q6_straight_since_ms = 0U;
+    uint8_t q3_last_sequence_phase = 0xFFU;
     bool x42s_version_reported = false;
     int left_speed = 0;
     int right_speed = 0;
@@ -1023,6 +1031,51 @@ int main(void)
         k230_control_ok = k230_ball_get_control_state(
             &k230_control, g_ms_ticks);
 
+        /*
+         * State 6 sends the six offline-tuning values independently of the
+         * vision stream.  Accept them only while Tianmeng is in M5 and idle;
+         * ball_balance_start_q3() snapshots them for the complete run.
+         */
+        if ((app_mode == APP_MODE_Q3_SEQUENCE) && !mode_started &&
+            k230_ball_get_q3_tune(&k230_q3_tune) &&
+            (k230_q3_tune.revision != q3_tune_applied_revision)) {
+            Q3OpenLoopParams q3_params;
+            uint8_t stage;
+
+            for (stage = 0U; stage < 3U; stage++) {
+                q3_params.angle_deg[stage] =
+                    (float)k230_q3_tune.angle_cdeg[stage] * 0.01f;
+                q3_params.time_ms[stage] = k230_q3_tune.time_ms[stage];
+            }
+            if (ball_balance_set_q3_open_loop_params(&q3_params)) {
+                debug_puts("MODE Q3 LCD PARAM APPLIED\r\n");
+            } else {
+                debug_puts("MODE Q3 LCD PARAM REJECTED\r\n");
+            }
+            q3_tune_applied_revision = k230_q3_tune.revision;
+        }
+
+        /* State 5/7 initial compensation angles are private to modes 2-4. */
+        if (app_mode_is_ball_drive(app_mode) && !mode_started &&
+            !tune.run && !q4_preload_pending &&
+            k230_ball_get_start_angles(&k230_start_angles) &&
+            (k230_start_angles.revision != start_angles_applied_revision)) {
+            bool angle_accepted = q4_motion_set_start_angles(
+                (float)k230_start_angles.angle_cdeg[0] * 0.01f,
+                (float)k230_start_angles.angle_cdeg[1] * 0.01f,
+                (float)k230_start_angles.angle_cdeg[2] * 0.01f);
+            bool bias_accepted = ball_balance_set_q67_target_biases(
+                (float)k230_start_angles.target_bias_mm[0],
+                (float)k230_start_angles.target_bias_mm[1],
+                (float)k230_start_angles.target_bias_mm[2],
+                (float)k230_start_angles.target_bias_mm[3]);
+            bool accepted = angle_accepted && bias_accepted;
+
+            debug_puts(accepted ? "MODE 2/3/4 LCD ANGLES APPLIED\r\n" :
+                                  "MODE 2/3/4 LCD ANGLES REJECTED\r\n");
+            start_angles_applied_revision = k230_start_angles.revision;
+        }
+
         if (b5_press_event()) {
             debug_print_keys("KEY K1 NEXT", &tune);
             stop_line_outputs(&tune);
@@ -1035,6 +1088,7 @@ int main(void)
             q6_curve_candidate_ms = 0U;
             q6_curve_enter_ms = 0U;
             q6_straight_since_ms = 0U;
+            q3_last_sequence_phase = 0xFFU;
             mode_started = false;
             line_paused = false;
             line_lap_reset(&line_lap_phase, &a_confirm_frames,
@@ -1060,11 +1114,42 @@ int main(void)
 
         if (b15_press_event()) {
             debug_print_keys("KEY K4 START", &tune);
-            if (app_mode_is_q6_family(app_mode) &&
+            if ((app_mode == APP_MODE_Q3_SEQUENCE) && !mode_started &&
+                (!k230_control_ok || (k230_control.mode != 6U) ||
+                 (k230_control.run_state != 1U))) {
+                debug_puts("MODE Q3 BLOCK K230 STATE6 NOT RUN\r\n");
+            } else if (app_mode_is_q6_family(app_mode) &&
                 !q4_preload_pending && !tune.run &&
                 (!k230_control_ok || (k230_control.mode != 7U) ||
                  (k230_control.run_state != 1U))) {
                 debug_puts("MODE Q6/Q7 BLOCK K230 STATE7 NOT RUN\r\n");
+            } else if (app_mode == APP_MODE_Q3_SEQUENCE) {
+                tune.run = false;
+                tune.line_active = false;
+                motor_stop();
+                if (mode_started) {
+                    ball_balance_stop();
+                    mode_started = false;
+                    line_paused = true;
+                    g_run_timer_enabled = false;
+                    debug_puts("MODE Q3 PAUSE\r\n");
+                } else {
+                    if (ball_balance_start_q3(g_ms_ticks)) {
+                        mode_started = true;
+                        line_paused = false;
+                        q3_last_sequence_phase =
+                            k230_control.sequence_phase;
+                        __disable_irq();
+                        g_run_time_ms = 0U;
+                        __enable_irq();
+                        g_run_timer_enabled = true;
+                        debug_puts("MODE Q3 OPEN LOOP START STATE6\r\n");
+                    } else {
+                        mode_started = false;
+                        g_run_timer_enabled = false;
+                        debug_puts("MODE Q3 BLOCK X42S NOT READY\r\n");
+                    }
+                }
             } else if (app_mode == APP_MODE_LINE_TIMER) {
                 if (tune.run) {
                     line_paused = true;
@@ -1181,6 +1266,19 @@ int main(void)
          * 补偿领先采用非阻塞计时：等待期间通信和X42S服务正常运行，
          * 但底盘保持停止；计时结束后才启动Q4运动时间轴和循迹。
          */
+        if ((app_mode == APP_MODE_Q3_SEQUENCE) && mode_started &&
+            k230_control_ok && (k230_control.mode == 6U) &&
+            (k230_control.run_state == 1U)) {
+            if (k230_control.sequence_phase != q3_last_sequence_phase) {
+                q3_last_sequence_phase = k230_control.sequence_phase;
+                debug_puts("MODE Q3 PHASE ");
+                debug_print_i32((int32_t)q3_last_sequence_phase);
+                debug_puts(" TARGET ");
+                debug_print_i32((int32_t)k230_control.target_mm);
+                debug_puts("\r\n");
+            }
+        }
+
         if (q4_preload_pending) {
             tune.run = false;
             tune.line_active = false;
@@ -1673,6 +1771,7 @@ int main(void)
         if ((g_ms_ticks - last_k230_status_ms) >= K230_STATUS_PERIOD_MS) {
             BallBalanceState ball_state = ball_balance_get_state();
             StepperArmState x42s_state = stepper_arm_get_state();
+            uint8_t reported_phase = (uint8_t)ball_state.mode;
             uint8_t status_flags = 0U;
             bool ball_control_running =
                 (ball_state.mode != BALL_MODE_IDLE) &&
@@ -1705,7 +1804,10 @@ int main(void)
                 status_flags |= K230_MCU_FLAG_MODE_Q6;
             }
 
-            k230_ball_send_mcu_status((uint8_t)ball_state.mode,
+            if (app_mode == APP_MODE_Q3_SEQUENCE) {
+                reported_phase = ball_balance_get_q3_report_phase();
+            }
+            k230_ball_send_mcu_status(reported_phase,
                 float_to_i16_saturated(ball_state.target_mm),
                 float_to_i16_saturated(ball_state.theta_deg * 100.0f),
                 float_to_i16_saturated(ball_state.velocity_mm_s),
@@ -1719,11 +1821,16 @@ int main(void)
             ((g_ms_ticks - last_oled_ms) >= 500U)) {
             last_oled_ms = g_ms_ticks;
             if ((app_mode == APP_MODE_LINE_TIMER) ||
-                app_mode_is_ball_drive(app_mode)) {
+                app_mode_is_ball_drive(app_mode) ||
+                (app_mode == APP_MODE_Q3_SEQUENCE)) {
                 BallBalanceState ball_state = ball_balance_get_state();
                 StepperArmState x42s_state = stepper_arm_get_state();
+                bool display_running =
+                    (app_mode == APP_MODE_Q3_SEQUENCE) ?
+                    mode_started : tune.run;
 
-                oled_show_line_mode(g_run_time_ms, mode_started, tune.run,
+                oled_show_line_mode(g_run_time_ms, mode_started,
+                    display_running,
                     line_paused, (uint8_t)app_mode + 1U,
                     (int32_t)ball_state.position_mm,
                     x42s_state.communication_ok);

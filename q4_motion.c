@@ -5,6 +5,9 @@
 static bool g_q4_active;
 static uint32_t g_q4_start_ms;
 static Q4MotionProfile g_motion_profile;
+static float g_mode2_start_angle_deg;
+static float g_mode3_start_angle_deg;
+static float g_mode4_start_angle_deg;
 
 static float q4_clamp_f32(float value, float minimum, float maximum)
 {
@@ -22,11 +25,32 @@ void q4_motion_init(void)
     g_q4_active = false;
     g_q4_start_ms = 0U;
     g_motion_profile = Q4_MOTION_PROFILE_CENTER;
+    g_mode2_start_angle_deg = Q4_INITIAL_ANGLE_DEG;
+    g_mode3_start_angle_deg = Q6_INITIAL_ANGLE_DEG;
+    g_mode4_start_angle_deg = Q7_INITIAL_ANGLE_DEG;
 }
 
 void q4_motion_select_profile(Q4MotionProfile profile)
 {
     g_motion_profile = profile;
+}
+
+bool q4_motion_set_start_angles(float mode2_deg, float mode3_deg,
+                                float mode4_deg)
+{
+    if (g_q4_active ||
+        (mode2_deg < -Q4_MAX_FEEDFORWARD_DEG) ||
+        (mode2_deg > Q4_MAX_FEEDFORWARD_DEG) ||
+        (mode3_deg < -Q6_MAX_FEEDFORWARD_DEG) ||
+        (mode3_deg > Q6_MAX_FEEDFORWARD_DEG) ||
+        (mode4_deg < -Q7_MAX_FEEDFORWARD_DEG) ||
+        (mode4_deg > Q7_MAX_FEEDFORWARD_DEG)) {
+        return false;
+    }
+    g_mode2_start_angle_deg = mode2_deg;
+    g_mode3_start_angle_deg = mode3_deg;
+    g_mode4_start_angle_deg = mode4_deg;
+    return true;
 }
 
 void q4_motion_start(uint32_t now_ms)
@@ -51,13 +75,13 @@ float q4_motion_get_start_feedforward_deg(void)
     float max_deg;
 
     if (g_motion_profile == Q4_MOTION_PROFILE_Q7_ARBITRARY) {
-        feedforward_deg = Q7_FEEDFORWARD_SIGN * Q7_INITIAL_ANGLE_DEG;
+        feedforward_deg = Q7_FEEDFORWARD_SIGN * g_mode4_start_angle_deg;
         max_deg = Q7_MAX_FEEDFORWARD_DEG;
     } else if (g_motion_profile == Q4_MOTION_PROFILE_ARBITRARY) {
-        feedforward_deg = Q6_FEEDFORWARD_SIGN * Q6_INITIAL_ANGLE_DEG;
+        feedforward_deg = Q6_FEEDFORWARD_SIGN * g_mode3_start_angle_deg;
         max_deg = Q6_MAX_FEEDFORWARD_DEG;
     } else {
-        feedforward_deg = Q4_FEEDFORWARD_SIGN * Q4_INITIAL_ANGLE_DEG;
+        feedforward_deg = Q4_FEEDFORWARD_SIGN * g_mode2_start_angle_deg;
         max_deg = Q4_MAX_FEEDFORWARD_DEG;
     }
 

@@ -28,7 +28,7 @@
 #define LINE_CORR_LIMIT         (460)
 #define LINE_MIN_WHEEL_TARGET   (25.0f)
 #define LINE_SEARCH_PWM         (0)
-#define LINE_CORRECTION_SIGN    (1)
+#define LINE_CORRECTION_SIGN    (-1)
 #define LINE_CURVE_ERR_START    (14)
 #define LINE_CURVE_TARGET_DROP  (55.0f)
 
@@ -278,6 +278,10 @@
 #define Q7_STRAIGHT_CASCADE_DEADBAND_MM (1.5f)
 #define Q7_STRAIGHT_TARGET_BIAS_MM (13.0f)
 
+/* State-7 LCD target-bias tuning envelope; +x points to hinge end. */
+#define Q67_TARGET_BIAS_TUNE_MIN_MM (-30.0f)
+#define Q67_TARGET_BIAS_TUNE_MAX_MM (30.0f)
+
 #define Q7_BALL_POS_KP            (0.080f)
 #define Q7_BALL_POS_KI            (0.004f)
 #define Q7_BALL_POS_KD            (0.000f)
@@ -307,10 +311,55 @@
 #define Q7_A_MIN_LAP_MS           (5000U)
 #define Q7_A_MIN_LAP_COUNTS       (9000U)
 
+/*
+ * Mode 5 / requirement 3 is intentionally independent from Q4/Q6/Q7.
+ * The three fixed stages and final PD values below are ported from the
+ * supplied Q3_CODE/mspm0_ccs reference project.
+ *
+ * The reference driver used PIPE_ANGLE_SIGN=-1 while this project applies
+ * BALL_ACTUATOR_ANGLE_SIGN later, so this private sign converts reference
+ * logical angles without changing any other mode's actuator direction.
+ */
+#define Q3_MODE5_TARGET_PLUS_MM          (50.0f)
+#define Q3_MODE5_TARGET_MINUS_MM         (-50.0f)
+#define Q3_MODE5_REFERENCE_ANGLE_SIGN    (1.0f)
+#define Q3_MODE5_OUT_ACCEL_ANGLE_DEG     (-1.50f)
+#define Q3_MODE5_OUT_ACCEL_TIME_MS       (800U)
+#define Q3_MODE5_TRANSFER_ANGLE_DEG      (1.20f)
+#define Q3_MODE5_TRANSFER_TIME_MS        (1600U)
+#define Q3_MODE5_FINAL_BRAKE_ANGLE_DEG   (-0.40f)
+#define Q3_MODE5_FINAL_BRAKE_TIME_MS     (450U)
+#define Q3_MODE5_OPEN_LOOP_MOTOR_DPS     (150.0f)
+
+/* State-6 LCD tuning safety envelope; private to Tianmeng mode M5. */
+#define Q3_MODE5_TUNE_ANGLE_MIN_DEG      (-2.50f)
+#define Q3_MODE5_TUNE_ANGLE_MAX_DEG      (2.50f)
+#define Q3_MODE5_TUNE_TIME_MIN_MS        (100U)
+#define Q3_MODE5_TUNE_TIME_MAX_MS        (3000U)
+#define Q3_MODE5_TUNE_TOTAL_MAX_MS       (4900U)
+
+/* 0: 三段结束后保持0度纯开环；1: 恢复最终-5 cm闭环微调。 */
+#define Q3_MODE5_FINAL_PID_ENABLE         (0)
+
+/* Final -5 cm visual PD hold, also copied from the reference project. */
+#define Q3_MODE5_HOLD_KP_DEG_PER_MM      (0.0180f)
+#define Q3_MODE5_HOLD_KI_DEG_PER_MM_S    (0.0100f)
+#define Q3_MODE5_HOLD_KD_DEG_PER_MM_S    (0.0022f)
+#define Q3_MODE5_HOLD_MAX_ANGLE_DEG      (1.20f)
+#define Q3_MODE5_HOLD_INTEGRAL_ZONE_MM   (30.0f)
+#define Q3_MODE5_HOLD_INT_MAX_ANGLE_DEG  (0.35f)
+#define Q3_MODE5_HOLD_MOTOR_DPS           (150.0f)
+
+/* Mode-5-only visual filtering; no Q4/Q6/Q7 parameter is reused. */
+#define Q3_MODE5_ACCEL_LIMIT_MM_S2        (1600.0f)
+#define Q3_MODE5_POSITION_FILTER_NEW      (0.55f)
+#define Q3_MODE5_VELOCITY_FILTER_NEW      (0.60f)
+#define Q3_MODE5_ACCEL_FILTER_NEW         (0.30f)
+
 #define A_MARK_DEFAULT_TOTAL    (3U)
 #define A_MARK_DEFAULT_SPAN     (3U)
 #define A_MARK_DEFAULT_FRAMES   (2U)
-#define A_MARK_FINISH_TOTAL     (3U)
+#define A_MARK_FINISH_TOTAL     (5U)
 #define A_MARK_FINISH_SPAN      (3U)
 #define A_MARK_RELEASE_FRAMES   (4U)
 #define A_MARK_MIN_LAP_MS       (5000U)

@@ -28,6 +28,8 @@ typedef enum {
 
 void q4_motion_init(void);
 void q4_motion_select_profile(Q4MotionProfile profile);
+bool q4_motion_set_start_angles(float mode2_deg, float mode3_deg,
+                                float mode4_deg);
 void q4_motion_start(uint32_t now_ms);
 void q4_motion_stop(void);
 bool q4_motion_is_active(void);

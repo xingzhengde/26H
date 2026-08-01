@@ -8,8 +8,10 @@
 #define K230_FRAME_HEAD_1 0x55U
 #define K230_MSG_BALL_POSITION 0x01U
 #define K230_MSG_CONTROL_STATE 0x02U
+#define K230_MSG_Q3_TUNE 0x04U
+#define K230_MSG_START_ANGLES 0x05U
 #define K230_MSG_MCU_STATUS 0x81U
-#define K230_MAX_PAYLOAD_SIZE 8U
+#define K230_MAX_PAYLOAD_SIZE 12U
 
 static volatile uint8_t g_rx_buf[K230_RX_BUF_SIZE];
 static volatile uint16_t g_rx_head;
@@ -17,6 +19,8 @@ static volatile uint16_t g_rx_tail;
 static volatile uint32_t g_irq_time_ms;
 static K230BallSample g_sample;
 static K230ControlState g_control_state;
+static K230Q3TuneParams g_q3_tune;
+static K230StartAngleParams g_start_angles;
 
 typedef enum {
     K230_PARSE_HEAD_0 = 0,
@@ -103,6 +107,64 @@ static void handle_valid_frame(void)
         g_control_state.sequence_phase = g_frame_payload[4];
         g_control_state.timestamp_ms = g_irq_time_ms;
         g_control_state.valid = true;
+    } else if ((g_frame_type == K230_MSG_Q3_TUNE) &&
+               (g_frame_length == 12U)) {
+        uint8_t stage;
+        bool changed = !g_q3_tune.valid;
+
+        for (stage = 0U; stage < 3U; stage++) {
+            uint8_t offset = (uint8_t)(stage * 4U);
+            int16_t angle_cdeg = (int16_t)(
+                (uint16_t)g_frame_payload[offset] |
+                ((uint16_t)g_frame_payload[offset + 1U] << 8U));
+            uint16_t time_ms = (uint16_t)(
+                (uint16_t)g_frame_payload[offset + 2U] |
+                ((uint16_t)g_frame_payload[offset + 3U] << 8U));
+
+            if ((g_q3_tune.angle_cdeg[stage] != angle_cdeg) ||
+                (g_q3_tune.time_ms[stage] != time_ms)) {
+                changed = true;
+            }
+            g_q3_tune.angle_cdeg[stage] = angle_cdeg;
+            g_q3_tune.time_ms[stage] = time_ms;
+        }
+        if (changed) {
+            g_q3_tune.revision++;
+        }
+        g_q3_tune.valid = true;
+    } else if ((g_frame_type == K230_MSG_START_ANGLES) &&
+               ((g_frame_length == 6U) || (g_frame_length == 10U))) {
+        uint8_t mode_index;
+        bool changed = !g_start_angles.valid;
+
+        for (mode_index = 0U; mode_index < 3U; mode_index++) {
+            uint8_t offset = (uint8_t)(mode_index * 2U);
+            int16_t angle_cdeg = (int16_t)(
+                (uint16_t)g_frame_payload[offset] |
+                ((uint16_t)g_frame_payload[offset + 1U] << 8U));
+
+            if (g_start_angles.angle_cdeg[mode_index] != angle_cdeg) {
+                changed = true;
+            }
+            g_start_angles.angle_cdeg[mode_index] = angle_cdeg;
+        }
+        if (g_frame_length == 10U) {
+            for (mode_index = 0U; mode_index < 4U; mode_index++) {
+                int8_t target_bias_mm =
+                    (int8_t)g_frame_payload[6U + mode_index];
+
+                if (g_start_angles.target_bias_mm[mode_index] !=
+                    target_bias_mm) {
+                    changed = true;
+                }
+                g_start_angles.target_bias_mm[mode_index] =
+                    target_bias_mm;
+            }
+        }
+        if (changed) {
+            g_start_angles.revision++;
+        }
+        g_start_angles.valid = true;
     }
 }
 
@@ -176,6 +238,18 @@ void k230_ball_init(void)
     g_sample.vision_latency_valid = false;
     g_sample.valid = false;
     g_control_state.valid = false;
+    g_q3_tune.revision = 0U;
+    g_q3_tune.valid = false;
+    g_start_angles.revision = 0U;
+    g_start_angles.target_bias_mm[0] =
+        (int8_t)Q6_STRAIGHT_TARGET_BIAS_MM;
+    g_start_angles.target_bias_mm[1] =
+        (int8_t)Q6_CURVE_TARGET_BIAS_MM;
+    g_start_angles.target_bias_mm[2] =
+        (int8_t)Q7_STRAIGHT_TARGET_BIAS_MM;
+    g_start_angles.target_bias_mm[3] =
+        (int8_t)Q7_CURVE_TARGET_BIAS_MM;
+    g_start_angles.valid = false;
     NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 }
 
@@ -232,6 +306,34 @@ bool k230_ball_get_control_state(K230ControlState *state, uint32_t now_ms)
         return false;
     }
     *state = g_control_state;
+    return true;
+}
+
+bool k230_ball_get_q3_tune(K230Q3TuneParams *params)
+{
+    uint8_t byte;
+
+    while (rx_pop(&byte)) {
+        parse_byte(byte);
+    }
+    if (!g_q3_tune.valid || (params == 0)) {
+        return false;
+    }
+    *params = g_q3_tune;
+    return true;
+}
+
+bool k230_ball_get_start_angles(K230StartAngleParams *params)
+{
+    uint8_t byte;
+
+    while (rx_pop(&byte)) {
+        parse_byte(byte);
+    }
+    if (!g_start_angles.valid || (params == 0)) {
+        return false;
+    }
+    *params = g_start_angles;
     return true;
 }
 

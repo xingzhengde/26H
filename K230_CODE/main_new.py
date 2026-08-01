@@ -11,12 +11,23 @@ try:
 except ImportError:
     import json
 
+try:
+    from machine import TOUCH
+except ImportError:
+    TOUCH = None
+
 
 # ==================== Hardware and model ====================
 MODEL_PATH = "/data/steelball_yolo11n_320_v6.kmodel"
 CALIBRATION_PATH = "/sdcard/h3_calibration.json"
 CALIBRATION_TEMP_PATH = "/sdcard/h3_calibration.tmp"
 CALIBRATION_VERSION = 1
+Q3_TUNE_PATH = "/sdcard/q3_open_loop.json"
+Q3_TUNE_TEMP_PATH = "/sdcard/q3_open_loop.tmp"
+Q3_TUNE_VERSION = 1
+START_ANGLE_PATH = "/sdcard/start_angles.json"
+START_ANGLE_TEMP_PATH = "/sdcard/start_angles.tmp"
+START_ANGLE_VERSION = 2
 
 LABELS = ["steel_ball"]
 MODEL_INPUT_SIZE = [320, 320]
@@ -107,8 +118,30 @@ FRAME_HEAD_1 = 0x55
 MSG_BALL_POSITION = 0x01
 MSG_CONTROL_STATE = 0x02
 MSG_PIXEL_POSITION = 0x03
+MSG_Q3_TUNE = 0x04
+MSG_START_ANGLES = 0x05
 MSG_MCU_STATUS = 0x81
+MCU_FLAG_RUNNING = 0x01
 CONTROL_SEND_INTERVAL_MS = 100
+Q3_TUNE_SEND_INTERVAL_MS = 250
+Q3_TOUCH_DEBOUNCE_MS = 250
+Q3_ANGLE_STEP_CDEG = 10
+Q3_TIME_STEP_MS = 50
+Q3_ANGLE_MIN_CDEG = -250
+Q3_ANGLE_MAX_CDEG = 250
+Q3_TIME_MIN_MS = 100
+Q3_TIME_MAX_MS = 3000
+Q3_TOTAL_TIME_MAX_MS = 4900
+Q3_DEFAULT_ANGLES_CDEG = [-150, 120, -40]
+Q3_DEFAULT_TIMES_MS = [800, 1600, 450]
+START_ANGLE_DEFAULT_CDEG = [170, 170, 170]
+START_ANGLE_MIN_CDEG = -300
+START_ANGLE_MAX_CDEG = 300
+START_ANGLE_STEP_CDEG = 10
+TARGET_BIAS_DEFAULT_MM = [8, 5, 13, 10]
+TARGET_BIAS_MIN_MM = -30
+TARGET_BIAS_MAX_MM = 30
+TARGET_BIAS_STEP_MM = 1
 # Always confirm the physical O point after the camera and tube are mounted.
 # A valid saved three-point calibration is still used for the mm scale.
 AUTO_HOLD_CENTER_ON_BOOT = False
@@ -389,6 +422,24 @@ def make_control_frame(mode, run_state, target_mm, sequence_phase):
     return make_frame(MSG_CONTROL_STATE, payload)
 
 
+def make_q3_tune_frame(angles_cdeg, times_ms):
+    payload = b""
+    for stage in range(3):
+        payload += int16_bytes(angles_cdeg[stage])
+        payload += bytes((times_ms[stage] & 0xFF,
+                          (times_ms[stage] >> 8) & 0xFF))
+    return make_frame(MSG_Q3_TUNE, payload)
+
+
+def make_start_angle_frame(angles_cdeg, target_bias_mm):
+    payload = b""
+    for angle_cdeg in angles_cdeg:
+        payload += int16_bytes(angle_cdeg)
+    for bias_mm in target_bias_mm:
+        payload += bytes((bias_mm & 0xFF,))
+    return make_frame(MSG_START_ANGLES, payload)
+
+
 def init_uart():
     fpioa = FPIOA()
     fpioa.set_function(UART_TX_GPIO, FPIOA.UART1_TXD)
@@ -632,6 +683,391 @@ class CalibrationStore:
         self.arbitrary_mm = data.get("arbitrary_mm")
         self.loaded = self.tube_valid()
         return self.loaded
+
+
+class StartAngleTouchTuner:
+    """Offline editor for start angles and mode-3/4 target biases."""
+
+    def __init__(self):
+        self.angles_cdeg = list(START_ANGLE_DEFAULT_CDEG)
+        self.target_bias_mm = list(TARGET_BIAS_DEFAULT_MM)
+        self.dirty = False
+        self.notice = ""
+        self.notice_ms = 0
+        self.touch_latched = False
+        self.last_touch_ms = 0
+
+    def load(self):
+        try:
+            with open(START_ANGLE_PATH, "r") as file:
+                data = json.loads(file.read())
+            angles = [int(value) for value in data.get("angles_cdeg", [])]
+            version = data.get("version")
+            biases = [int(value) for value in data.get(
+                "target_bias_mm", TARGET_BIAS_DEFAULT_MM
+            )]
+        except (OSError, ValueError, TypeError):
+            return False
+        if version not in (1, START_ANGLE_VERSION) or len(angles) != 3:
+            return False
+        for angle in angles:
+            if angle < START_ANGLE_MIN_CDEG or angle > START_ANGLE_MAX_CDEG:
+                return False
+        if len(biases) != 4:
+            return False
+        for bias in biases:
+            if bias < TARGET_BIAS_MIN_MM or bias > TARGET_BIAS_MAX_MM:
+                return False
+        self.angles_cdeg = angles
+        self.target_bias_mm = biases
+        self.dirty = False
+        return True
+
+    def save(self, now):
+        data = {
+            "version": START_ANGLE_VERSION,
+            "angles_cdeg": self.angles_cdeg,
+            "target_bias_mm": self.target_bias_mm,
+        }
+        try:
+            with open(START_ANGLE_TEMP_PATH, "w") as file:
+                file.write(json.dumps(data))
+            try:
+                os.remove(START_ANGLE_PATH)
+            except OSError:
+                pass
+            os.rename(START_ANGLE_TEMP_PATH, START_ANGLE_PATH)
+            self.dirty = False
+            self.set_notice("SAVED + SENT", now)
+            return True
+        except OSError:
+            self.set_notice("SAVE FAILED", now)
+            return False
+
+    def set_notice(self, text, now):
+        self.notice = text
+        self.notice_ms = now
+
+    def visible_notice(self, now):
+        if self.notice and ticks_diff(now, self.notice_ms) <= 1500:
+            return self.notice
+        return ""
+
+    def _rows_for_mode(self, mode):
+        if mode == MODE_HOLD_CENTER:
+            return (("MODE 2 ANG", "angle", 0),)
+        return (
+            ("MODE 3 ANG", "angle", 1),
+            ("MODE 4 ANG", "angle", 2),
+            ("M3 STR BIAS", "bias", 0),
+            ("M3 CUR BIAS", "bias", 1),
+            ("M4 STR BIAS", "bias", 2),
+            ("M4 CUR BIAS", "bias", 3),
+        )
+
+    def _layout(self, display_size, row_count):
+        width, height = display_size
+        top = 88
+        row_height = min(58, max(34, (height - top - 48) // row_count))
+        return top, row_height, width - 218, width - 108
+
+    def handle_touch(self, touch_points, display_size, mode, now):
+        if not touch_points:
+            self.touch_latched = False
+            return False
+        down_point = None
+        for point in touch_points:
+            if point.event == TOUCH.EVENT_UP:
+                self.touch_latched = False
+            elif point.event == TOUCH.EVENT_DOWN and down_point is None:
+                down_point = point
+        if (down_point is None or self.touch_latched or
+                ticks_diff(now, self.last_touch_ms) < Q3_TOUCH_DEBOUNCE_MS):
+            return False
+
+        self.touch_latched = True
+        self.last_touch_ms = now
+        width, height = display_size
+        x = down_point.x
+        y = down_point.y
+        if height - 43 <= y <= height - 4 and 12 <= x <= 170:
+            self.save(now)
+            return True
+
+        rows = self._rows_for_mode(mode)
+        top, row_height, minus_left, plus_left = self._layout(
+            display_size, len(rows)
+        )
+        row = (y - top) // row_height
+        if row < 0 or row >= len(rows):
+            return False
+        delta = -1 if minus_left <= x <= minus_left + 90 else (
+            1 if plus_left <= x <= min(width - 8, plus_left + 90) else 0
+        )
+        if delta == 0:
+            return False
+        _, value_type, index = rows[row]
+        if value_type == "angle":
+            value = clamp(
+                self.angles_cdeg[index] + delta * START_ANGLE_STEP_CDEG,
+                START_ANGLE_MIN_CDEG,
+                START_ANGLE_MAX_CDEG,
+            )
+            if value == self.angles_cdeg[index]:
+                return False
+            self.angles_cdeg[index] = value
+        else:
+            value = clamp(
+                self.target_bias_mm[index] + delta * TARGET_BIAS_STEP_MM,
+                TARGET_BIAS_MIN_MM,
+                TARGET_BIAS_MAX_MM,
+            )
+            if value == self.target_bias_mm[index]:
+                return False
+            self.target_bias_mm[index] = value
+        self.dirty = True
+        self.set_notice("RAM SENT; TAP SAVE", now)
+        return True
+
+    def draw(self, osd, display_size, state, position_mm, touch_ready, now):
+        white = (255, 255, 255)
+        yellow = (255, 255, 0)
+        green = (0, 255, 0)
+        red = (255, 0, 0)
+        cyan = (0, 255, 255)
+        width, height = display_size
+        rows = self._rows_for_mode(state.mode)
+        top, row_height, minus_left, plus_left = self._layout(
+            display_size, len(rows)
+        )
+
+        title = "STATE 5 / MCU MODE 2 START ANGLE" if state.mode == MODE_HOLD_CENTER else \
+            "STATE 7 / MODE 3+4 TUNE"
+        osd.draw_string_advanced(8, 4, 22, title, color=yellow)
+        ball_text = "BALL --" if position_mm is None else "BALL %+dMM" % position_mm
+        osd.draw_string_advanced(8, 36, 18,
+                                 "%s  ANG 0.10DEG  BIAS 1MM" % ball_text,
+                                 color=white)
+        osd.draw_string_advanced(8, 62, 16, state.prompt(), color=cyan)
+        for row, item in enumerate(rows):
+            label, value_type, index = item
+            y = top + row * row_height
+            value_text = ("%+.2f DEG" % (self.angles_cdeg[index] / 100.0)
+                          if value_type == "angle" else
+                          "%+d MM" % self.target_bias_mm[index])
+            font_size = 17 if len(rows) > 2 else 20
+            osd.draw_string_advanced(8, y, font_size, label, color=cyan)
+            osd.draw_string_advanced(145, y, font_size, value_text,
+                                     color=white)
+            osd.draw_rectangle(minus_left, y - 2, 90, row_height - 3,
+                               color=green, thickness=2)
+            osd.draw_string_advanced(minus_left + 34, y, 20, "-", color=green)
+            osd.draw_rectangle(plus_left, y - 2, 90, row_height - 3,
+                               color=green, thickness=2)
+            osd.draw_string_advanced(plus_left + 34, y, 20, "+", color=green)
+
+        osd.draw_rectangle(12, height - 43, 158, 39, color=yellow, thickness=2)
+        osd.draw_string_advanced(50, height - 39, 20, "SAVE", color=yellow)
+        status = self.visible_notice(now)
+        if not status:
+            status = "UNSAVED" if self.dirty else "SAVED"
+        osd.draw_string_advanced(190, height - 38, 18, status,
+                                 color=yellow if self.dirty else green)
+        if not touch_ready:
+            osd.draw_string_advanced(width - 210, height - 38, 18,
+                                     "TOUCH NOT READY", color=red)
+
+
+class Q3TouchTuner:
+    """State-6-only editor for the three open-loop angles and durations."""
+
+    def __init__(self):
+        self.angles_cdeg = list(Q3_DEFAULT_ANGLES_CDEG)
+        self.times_ms = list(Q3_DEFAULT_TIMES_MS)
+        self.dirty = False
+        self.notice = ""
+        self.notice_ms = 0
+        # A physical touch may produce several DOWN reports across frames.
+        # Keep one action latched until release and also enforce a time guard.
+        self.touch_latched = False
+        self.last_touch_ms = 0
+
+    def _valid(self, angles, times):
+        if len(angles) != 3 or len(times) != 3:
+            return False
+        for value in angles:
+            if value < Q3_ANGLE_MIN_CDEG or value > Q3_ANGLE_MAX_CDEG:
+                return False
+        for value in times:
+            if value < Q3_TIME_MIN_MS or value > Q3_TIME_MAX_MS:
+                return False
+        return sum(times) <= Q3_TOTAL_TIME_MAX_MS
+
+    def load(self):
+        try:
+            with open(Q3_TUNE_PATH, "r") as file:
+                data = json.loads(file.read())
+            angles = [int(value) for value in data.get("angles_cdeg", [])]
+            times = [int(value) for value in data.get("times_ms", [])]
+        except (OSError, ValueError, TypeError):
+            return False
+        if data.get("version") != Q3_TUNE_VERSION:
+            return False
+        if not self._valid(angles, times):
+            return False
+        self.angles_cdeg = angles
+        self.times_ms = times
+        self.dirty = False
+        return True
+
+    def save(self, now):
+        data = {
+            "version": Q3_TUNE_VERSION,
+            "angles_cdeg": self.angles_cdeg,
+            "times_ms": self.times_ms,
+        }
+        try:
+            with open(Q3_TUNE_TEMP_PATH, "w") as file:
+                file.write(json.dumps(data))
+            try:
+                os.remove(Q3_TUNE_PATH)
+            except OSError:
+                pass
+            os.rename(Q3_TUNE_TEMP_PATH, Q3_TUNE_PATH)
+            self.dirty = False
+            self.set_notice("SAVED + SENT", now)
+            return True
+        except OSError:
+            self.set_notice("SAVE FAILED", now)
+            return False
+
+    def set_notice(self, text, now):
+        self.notice = text
+        self.notice_ms = now
+
+    def visible_notice(self, now):
+        if self.notice and ticks_diff(now, self.notice_ms) <= 1500:
+            return self.notice
+        return ""
+
+    def _layout(self, display_size):
+        width, height = display_size
+        top = 72
+        bottom = height - 46
+        row_height = max(36, (bottom - top) // 6)
+        minus_left = width - 218
+        plus_left = width - 108
+        return top, row_height, minus_left, plus_left
+
+    def handle_touch(self, touch_points, display_size, now):
+        if not touch_points:
+            self.touch_latched = False
+            return False
+        top, row_height, minus_left, plus_left = self._layout(display_size)
+        width, height = display_size
+        down_point = None
+        for point in touch_points:
+            if point.event == TOUCH.EVENT_UP:
+                self.touch_latched = False
+            elif point.event == TOUCH.EVENT_DOWN and down_point is None:
+                down_point = point
+
+        if (down_point is None or self.touch_latched or
+                ticks_diff(now, self.last_touch_ms) < Q3_TOUCH_DEBOUNCE_MS):
+            return False
+
+        # Only the first DOWN point can change one parameter in this frame.
+        self.touch_latched = True
+        self.last_touch_ms = now
+        x = down_point.x
+        y = down_point.y
+        if height - 43 <= y <= height - 4 and 12 <= x <= 170:
+            self.save(now)
+            return True
+        row = (y - top) // row_height
+        if row < 0 or row >= 6:
+            return False
+        delta = 0
+        if minus_left <= x <= minus_left + 90:
+            delta = -1
+        elif plus_left <= x <= min(width - 8, plus_left + 90):
+            delta = 1
+        if delta == 0:
+            return False
+
+        changed = False
+        stage = row // 2
+        if row % 2 == 0:
+            value = clamp(
+                self.angles_cdeg[stage] + delta * Q3_ANGLE_STEP_CDEG,
+                Q3_ANGLE_MIN_CDEG,
+                Q3_ANGLE_MAX_CDEG,
+            )
+            if value != self.angles_cdeg[stage]:
+                self.angles_cdeg[stage] = value
+                changed = True
+        else:
+            value = clamp(
+                self.times_ms[stage] + delta * Q3_TIME_STEP_MS,
+                Q3_TIME_MIN_MS,
+                Q3_TIME_MAX_MS,
+            )
+            proposed_total = sum(self.times_ms) - self.times_ms[stage] + value
+            if proposed_total > Q3_TOTAL_TIME_MAX_MS:
+                self.set_notice("TOTAL MUST BE <= 4900MS", now)
+            elif value != self.times_ms[stage]:
+                self.times_ms[stage] = value
+                changed = True
+
+        if changed:
+            self.dirty = True
+            self.set_notice("RAM SENT; TAP SAVE", now)
+        return changed
+
+    def draw(self, osd, display_size, touch_ready, now):
+        white = (255, 255, 255)
+        yellow = (255, 255, 0)
+        green = (0, 255, 0)
+        red = (255, 0, 0)
+        cyan = (0, 255, 255)
+        top, row_height, minus_left, plus_left = self._layout(display_size)
+        width, height = display_size
+
+        osd.draw_string_advanced(8, 4, 24, "STATE 6 OPEN-LOOP TUNE", color=yellow)
+        osd.draw_string_advanced(
+            8, 34, 18,
+            "ANGLE 0.10DEG  TIME 50MS  DEBOUNCE 250MS  TOTAL %dMS"
+            % sum(self.times_ms),
+            color=white,
+        )
+        labels = ("S1 ANG", "S1 TIME", "S2 ANG", "S2 TIME",
+                  "S3 ANG", "S3 TIME")
+        for row in range(6):
+            y = top + row * row_height
+            stage = row // 2
+            if row % 2 == 0:
+                value_text = "%+.2f DEG" % (self.angles_cdeg[stage] / 100.0)
+            else:
+                value_text = "%d MS" % self.times_ms[stage]
+            osd.draw_string_advanced(8, y, 19, labels[row], color=cyan)
+            osd.draw_string_advanced(118, y, 19, value_text, color=white)
+            osd.draw_rectangle(minus_left, y - 2, 90, row_height - 3,
+                               color=green, thickness=2)
+            osd.draw_string_advanced(minus_left + 34, y, 22, "-", color=green)
+            osd.draw_rectangle(plus_left, y - 2, 90, row_height - 3,
+                               color=green, thickness=2)
+            osd.draw_string_advanced(plus_left + 34, y, 22, "+", color=green)
+
+        osd.draw_rectangle(12, height - 43, 158, 39, color=yellow, thickness=2)
+        osd.draw_string_advanced(50, height - 39, 20, "SAVE", color=yellow)
+        status = self.visible_notice(now)
+        if not status:
+            status = "UNSAVED" if self.dirty else "SAVED"
+        osd.draw_string_advanced(190, height - 38, 18, status,
+                                 color=yellow if self.dirty else green)
+        if not touch_ready:
+            osd.draw_string_advanced(width - 210, height - 38, 18,
+                                     "TOUCH NOT READY", color=red)
 
 
 class H3StateMachine:
@@ -887,6 +1323,31 @@ class H3StateMachine:
             or position_mm is None
         ):
             return
+        if (
+            self.mcu_status is None
+            or not self.mcu_status.online(now)
+            or not (self.mcu_status.flags & MCU_FLAG_RUNNING)
+        ):
+            return
+
+        # Mode 6 uses the Tianmengxing fixed open-loop timeline as the single
+        # source of phase timing.  K230 only supplies calibrated position and
+        # mirrors the MCU phase/target for its UI and control-state frame.
+        # TARGET_TOLERANCE_MM remains unchanged for other/fallback logic, but
+        # it must not make a second state machine switch the open-loop stages.
+        mcu_phase = int(self.mcu_status.phase)
+        if SEQ_WAIT_CENTER <= mcu_phase <= SEQ_HOLD_NEGATIVE:
+            if mcu_phase != self.sequence_phase:
+                phase_notice = (
+                    "WAIT CENTER",
+                    "OPEN TO +50MM",
+                    "OPEN TO -50MM",
+                    "OPEN DONE LEVEL",
+                )
+                self.set_notice(phase_notice[mcu_phase], now)
+            self.sequence_phase = mcu_phase
+            self.target_mm = int(self.mcu_status.target_mm)
+            return
 
         if self.sequence_phase == SEQ_WAIT_CENTER:
             self.target_mm = 0
@@ -963,11 +1424,22 @@ class H3StateMachine:
 
 
 def draw_status(osd, display_size, state, center_x, center_y, position_mm,
-                confidence, inference_ms, fps, prediction_pixels, now):
+                confidence, inference_ms, fps, prediction_pixels, now,
+                q3_tuner, start_angle_tuner, touch_ready):
     white = (255, 255, 255)
     yellow = (255, 255, 0)
     red = (255, 0, 0)
     green = (0, 255, 0)
+
+    if state.mode == MODE_Q3_SEQUENCE and state.run_state != RUN_RUNNING:
+        q3_tuner.draw(osd, display_size, touch_ready, now)
+        return
+    if (state.mode in (MODE_HOLD_CENTER, MODE_HOLD_ARBITRARY)
+            and state.run_state != RUN_RUNNING):
+        start_angle_tuner.draw(
+            osd, display_size, state, position_mm, touch_ready, now
+        )
+        return
 
     osd.draw_string_advanced(
         8, 6, 24,
@@ -1063,6 +1535,10 @@ def main():
     pipeline = None
     detector = None
     calibration = CalibrationStore()
+    q3_tuner = Q3TouchTuner()
+    q3_tune_loaded = q3_tuner.load()
+    start_angle_tuner = StartAngleTouchTuner()
+    start_angle_loaded = start_angle_tuner.load()
     state = H3StateMachine(calibration)
     mcu_parser = MCUStatusParser()
     predictor = MotionPredictor()
@@ -1070,6 +1546,8 @@ def main():
     recent_centers_y = []
     frame_counter = 0
     last_control_send_ms = 0
+    last_q3_tune_send_ms = 0
+    last_start_angle_send_ms = 0
     last_print_ms = 0
     last_frame_done_ms = 0
     fps = 0.0
@@ -1082,6 +1560,12 @@ def main():
         )
         pipeline.create(sensor_id=2, to_ide=SEND_TO_IDE)
         display_size = pipeline.get_display_size()
+        touch = None
+        if TOUCH is not None:
+            try:
+                touch = TOUCH(0)
+            except BaseException as error:
+                print("Touch init failed:", error)
         calibration.set_display_size(display_size)
         loaded = calibration.load()
         if AUTO_HOLD_CENTER_ON_BOOT and loaded:
@@ -1110,6 +1594,9 @@ def main():
         print("H3 K230 state machine started")
         print("Display:", display_size)
         print("Calibration loaded:", loaded)
+        print("Q3 tune loaded:", q3_tune_loaded)
+        print("Start angles loaded:", start_angle_loaded)
+        print("Touch ready:", touch is not None)
         print("KEY1=start/mark KEY2=pause KEY3=mode")
 
         while True:
@@ -1269,6 +1756,31 @@ def main():
             elif mode_event == Button.EVENT_LONG:
                 state.return_to_detect(now)
 
+            state.update_sequence(control_position_mm, now)
+
+            q3_tune_changed = False
+            start_angle_changed = False
+            if (touch is not None and state.run_state != RUN_RUNNING
+                    and state.mode in (MODE_HOLD_CENTER,
+                                       MODE_Q3_SEQUENCE,
+                                       MODE_HOLD_ARBITRARY)):
+                try:
+                    touch_points = touch.read()
+                    if state.mode == MODE_Q3_SEQUENCE:
+                        q3_tune_changed = q3_tuner.handle_touch(
+                            touch_points, display_size, now
+                        )
+                    else:
+                        start_angle_changed = start_angle_tuner.handle_touch(
+                            touch_points, display_size, state.mode, now
+                        )
+                except BaseException as error:
+                    if state.mode == MODE_Q3_SEQUENCE:
+                        q3_tuner.set_notice("TOUCH READ FAILED", now)
+                    else:
+                        start_angle_tuner.set_notice("TOUCH READ FAILED", now)
+                    print("Touch read failed:", error)
+
             if (
                 control_x is not None
                 and control_position_mm is not None
@@ -1298,6 +1810,27 @@ def main():
                 )
                 last_control_send_ms = now
 
+            if (state.mode == MODE_Q3_SEQUENCE
+                    and state.run_state != RUN_RUNNING
+                    and (q3_tune_changed or ticks_diff(
+                        now, last_q3_tune_send_ms
+                    ) >= Q3_TUNE_SEND_INTERVAL_MS)):
+                uart.write(make_q3_tune_frame(
+                    q3_tuner.angles_cdeg, q3_tuner.times_ms
+                ))
+                last_q3_tune_send_ms = now
+
+            if (state.mode in (MODE_HOLD_CENTER, MODE_HOLD_ARBITRARY)
+                    and state.run_state != RUN_RUNNING
+                    and (start_angle_changed or ticks_diff(
+                        now, last_start_angle_send_ms
+                    ) >= Q3_TUNE_SEND_INTERVAL_MS)):
+                uart.write(make_start_angle_frame(
+                    start_angle_tuner.angles_cdeg,
+                    start_angle_tuner.target_bias_mm,
+                ))
+                last_start_angle_send_ms = now
+
             draw_status(
                 pipeline.osd_img,
                 display_size,
@@ -1310,6 +1843,9 @@ def main():
                 fps,
                 prediction_x,
                 now,
+                q3_tuner,
+                start_angle_tuner,
+                touch is not None,
             )
 
             if ticks_diff(now, last_print_ms) >= PRINT_INTERVAL_MS:

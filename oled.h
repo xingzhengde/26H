@@ -370,7 +370,15 @@ static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
     char line[20];
 
     oled_puts_fixed(0U, 0U, "26H CAR", 21U);
-    if (competition_mode == 4U) {
+    if (competition_mode == 5U) {
+        if (paused) {
+            oled_puts_fixed(2U, 0U, "M5 Q3 SEQ PAUSE", 21U);
+        } else {
+            oled_puts_fixed(2U, 0U, started ?
+                (running ? "M5 Q3 SEQ RUN" : "M5 Q3 SEQ DONE") :
+                "M5 Q3 SEQ READY", 21U);
+        }
+    } else if (competition_mode == 4U) {
         if (paused) {
             oled_puts_fixed(2U, 0U, "M4 Q7 ANY PAUSE", 21U);
         } else {
