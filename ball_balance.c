@@ -28,6 +28,7 @@ static float g_feedback_deg;
 static float g_feedback_scale;
 static bool g_q4_hold_active;
 static bool g_q6_hold_active;
+static bool g_q7_hold_active;
 
 typedef struct {
     float pos_kp, pos_ki, pos_kd, pos_weight;
@@ -64,6 +65,19 @@ static const BallPidConfig g_q6_pid = {
     Q6_BALL_LOOKAHEAD_MAX_MS, Q6_BALL_PREDICT_POS_MAX_MM,
     Q6_BALL_PREDICT_SPEED_DELTA_MAX, Q6_BALL_POS_OUT_MAX_DEG,
     Q6_BALL_SPEED_OUT_MAX_DEG, Q6_BALL_PID_MAX_THETA
+};
+
+static const BallPidConfig g_q7_pid = {
+    Q7_BALL_POS_KP, Q7_BALL_POS_KI, Q7_BALL_POS_KD, Q7_BALL_POS_WEIGHT,
+    Q7_BALL_SPEED_KP, Q7_BALL_SPEED_KI, Q7_BALL_SPEED_KD,
+    Q7_BALL_SPEED_WEIGHT, Q7_BALL_PID_DEADBAND_MM,
+    Q7_BALL_PID_INT_LIMIT, Q7_BALL_SPEED_INT_LIMIT,
+    Q7_BALL_ACCEL_LIMIT_MM_S2, Q7_BALL_POSITION_FILTER_NEW,
+    Q7_BALL_VELOCITY_FILTER_NEW, Q7_BALL_ACCEL_FILTER_NEW,
+    Q7_BALL_MEDIAN_DELAY_FRAMES, Q7_BALL_ACTUATOR_LOOKAHEAD_MS,
+    Q7_BALL_LOOKAHEAD_MAX_MS, Q7_BALL_PREDICT_POS_MAX_MM,
+    Q7_BALL_PREDICT_SPEED_DELTA_MAX, Q7_BALL_POS_OUT_MAX_DEG,
+    Q7_BALL_SPEED_OUT_MAX_DEG, Q7_BALL_PID_MAX_THETA
 };
 
 /**
@@ -153,6 +167,7 @@ void ball_balance_init(void)
     g_feedback_scale = 1.0f;
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_q7_hold_active = false;
     g_state.mode = BALL_MODE_IDLE;
     g_state.target_mm = 0.0f;
     g_state.sample_ok = false;
@@ -163,6 +178,7 @@ void ball_balance_start_sequence(void)
 {
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_q7_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_SEQ_PLUS;
@@ -174,6 +190,7 @@ void ball_balance_hold_target(float target_mm)
 {
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_q7_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -185,6 +202,7 @@ void ball_balance_hold_q4(float target_mm)
 {
     g_q4_hold_active = true;
     g_q6_hold_active = false;
+    g_q7_hold_active = false;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -196,6 +214,19 @@ void ball_balance_hold_q6(float target_mm)
 {
     g_q4_hold_active = true;
     g_q6_hold_active = true;
+    g_q7_hold_active = false;
+    g_curve_feedforward_deg = 0.0f;
+    g_feedback_scale = 0.0f;
+    g_state.mode = BALL_MODE_HOLD_TARGET;
+    g_state.target_mm = target_mm;
+    reset_loop_state();
+}
+
+void ball_balance_hold_q7(float target_mm)
+{
+    g_q4_hold_active = true;
+    g_q6_hold_active = true;
+    g_q7_hold_active = true;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 0.0f;
     g_state.mode = BALL_MODE_HOLD_TARGET;
@@ -205,8 +236,9 @@ void ball_balance_hold_q6(float target_mm)
 
 void ball_balance_set_feedforward(float pipe_angle_deg)
 {
-    float max_deg = g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
-        Q4_MAX_FEEDFORWARD_DEG;
+    float max_deg = g_q7_hold_active ? Q7_MAX_FEEDFORWARD_DEG :
+        (g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
+         Q4_MAX_FEEDFORWARD_DEG);
 
     g_feedforward_deg = clamp_f32_ball(pipe_angle_deg, -max_deg, max_deg);
     if (g_q4_hold_active) {
@@ -224,8 +256,12 @@ void ball_balance_set_curve_feedforward(float pipe_angle_deg)
         g_q6_curve_cascade_active = false;
         return;
     }
-    g_curve_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
-        -Q6_CURVE_FF_MAX_DEG, Q6_CURVE_FF_MAX_DEG);
+    {
+        float max_deg = g_q7_hold_active ? Q7_CURVE_FF_MAX_DEG :
+            Q6_CURVE_FF_MAX_DEG;
+        g_curve_feedforward_deg = clamp_f32_ball(pipe_angle_deg,
+            -max_deg, max_deg);
+    }
     cascade_active = abs_f32(g_curve_feedforward_deg) > 0.02f;
     if (cascade_active != g_q6_curve_cascade_active) {
         /* Reset both controllers at curve transitions to avoid stale I terms. */
@@ -254,10 +290,12 @@ void ball_balance_set_feedback_scale(float scale)
 
 void ball_balance_set_initial_feedforward(float pipe_angle_deg)
 {
-    float max_deg = g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
-        Q4_MAX_FEEDFORWARD_DEG;
-    float rate_deg_s = g_q6_hold_active ?
-        Q6_INITIAL_ANGLE_RATE_DEG_S : Q4_INITIAL_ANGLE_RATE_DEG_S;
+    float max_deg = g_q7_hold_active ? Q7_MAX_FEEDFORWARD_DEG :
+        (g_q6_hold_active ? Q6_MAX_FEEDFORWARD_DEG :
+         Q4_MAX_FEEDFORWARD_DEG);
+    float rate_deg_s = g_q7_hold_active ? Q7_INITIAL_ANGLE_RATE_DEG_S :
+        (g_q6_hold_active ? Q6_INITIAL_ANGLE_RATE_DEG_S :
+         Q4_INITIAL_ANGLE_RATE_DEG_S);
 
     g_feedforward_deg = clamp_f32_ball(pipe_angle_deg, -max_deg, max_deg);
     if (g_q4_hold_active) {
@@ -271,6 +309,7 @@ void ball_balance_stop(void)
     g_state.mode = BALL_MODE_IDLE;
     g_q4_hold_active = false;
     g_q6_hold_active = false;
+    g_q7_hold_active = false;
     g_feedforward_deg = 0.0f;
     g_curve_feedforward_deg = 0.0f;
     g_feedback_scale = 1.0f;
@@ -323,8 +362,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     float target_velocity;
     float speed_error;
     uint32_t sample_dt_ms;
-    const BallPidConfig *pid_cfg = g_q6_hold_active ?
-        &g_q6_pid : &g_q4_pid;
+    const BallPidConfig *pid_cfg = g_q7_hold_active ? &g_q7_pid :
+        (g_q6_hold_active ? &g_q6_pid : &g_q4_pid);
 
     (void)now_ms;
     g_state.sample_ok = sample_ok;
@@ -485,100 +524,150 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
 
         if (q6_curve_control) {
             float target_velocity_mm_s;
+            float pos_kp = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_POS_KP : Q6_CURVE_CASCADE_POS_KP;
+            float pos_ki = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_POS_KI : Q6_CURVE_CASCADE_POS_KI;
+            float pos_kd = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_POS_KD : Q6_CURVE_CASCADE_POS_KD;
+            float pos_int_limit = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_POS_INT_LIMIT :
+                Q6_CURVE_CASCADE_POS_INT_LIMIT;
+            float target_speed_max = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S :
+                Q6_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S;
+            float speed_kp = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_SPEED_KP : Q6_CURVE_CASCADE_SPEED_KP;
+            float speed_ki = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_SPEED_KI : Q6_CURVE_CASCADE_SPEED_KI;
+            float speed_kd = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_SPEED_KD : Q6_CURVE_CASCADE_SPEED_KD;
+            float speed_int_limit = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_SPEED_INT_LIMIT :
+                Q6_CURVE_CASCADE_SPEED_INT_LIMIT;
+            float angle_max = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_ANGLE_MAX_DEG :
+                Q6_CURVE_CASCADE_ANGLE_MAX_DEG;
+            float deadband_mm = g_q7_hold_active ?
+                Q7_CURVE_CASCADE_DEADBAND_MM :
+                Q6_CURVE_CASCADE_DEADBAND_MM;
+            float target_bias_mm = g_q7_hold_active ?
+                Q7_CURVE_TARGET_BIAS_MM : Q6_CURVE_TARGET_BIAS_MM;
 
             /* Compensate the measured curve equilibrium bias toward motor end. */
-            pos_error += Q6_CURVE_TARGET_BIAS_MM;
+            pos_error += target_bias_mm;
 
             /* Position outer loop: position error becomes target ball speed. */
-            if (abs_f32(pos_error) <= Q6_CURVE_CASCADE_DEADBAND_MM) {
+            if (abs_f32(pos_error) <= deadband_mm) {
                 pos_error = 0.0f;
                 g_q6_curve_position_integral *= 0.85f;
             } else {
                 g_q6_curve_position_integral += pos_error * dt_s;
                 g_q6_curve_position_integral = clamp_f32_ball(
                     g_q6_curve_position_integral,
-                    -Q6_CURVE_CASCADE_POS_INT_LIMIT,
-                    Q6_CURVE_CASCADE_POS_INT_LIMIT);
+                    -pos_int_limit, pos_int_limit);
             }
             target_velocity_mm_s =
-                (Q6_CURVE_CASCADE_POS_KP * pos_error) +
-                (Q6_CURVE_CASCADE_POS_KI *
+                (pos_kp * pos_error) +
+                (pos_ki *
                     g_q6_curve_position_integral) -
-                (Q6_CURVE_CASCADE_POS_KD * control_velocity_mm_s);
+                (pos_kd * control_velocity_mm_s);
             target_velocity_mm_s = clamp_f32_ball(target_velocity_mm_s,
-                -Q6_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S,
-                Q6_CURVE_CASCADE_TARGET_SPEED_MAX_MM_S);
+                -target_speed_max, target_speed_max);
 
             /* Speed inner loop: target speed becomes the pipe angle command. */
             speed_error = target_velocity_mm_s - control_velocity_mm_s;
             g_q6_curve_speed_integral += speed_error * dt_s;
             g_q6_curve_speed_integral = clamp_f32_ball(
                 g_q6_curve_speed_integral,
-                -Q6_CURVE_CASCADE_SPEED_INT_LIMIT,
-                Q6_CURVE_CASCADE_SPEED_INT_LIMIT);
+                -speed_int_limit, speed_int_limit);
             speed_derivative =
                 (speed_error - g_q6_curve_last_speed_error) / dt_s;
             speed_derivative = clamp_f32_ball(speed_derivative,
                 -pid_cfg->accel_limit, pid_cfg->accel_limit);
             g_q6_curve_last_speed_error = speed_error;
             g_feedback_deg = -(
-                (Q6_CURVE_CASCADE_SPEED_KP * speed_error) +
-                (Q6_CURVE_CASCADE_SPEED_KI *
+                (speed_kp * speed_error) +
+                (speed_ki *
                     g_q6_curve_speed_integral) +
-                (Q6_CURVE_CASCADE_SPEED_KD * speed_derivative));
+                (speed_kd * speed_derivative));
             g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-                -Q6_CURVE_CASCADE_ANGLE_MAX_DEG,
-                Q6_CURVE_CASCADE_ANGLE_MAX_DEG);
+                -angle_max, angle_max);
             apply_pipe_command();
             return;
         }
 
         if (g_q6_hold_active) {
             float target_velocity_mm_s;
+            float pos_kp = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_POS_KP : Q6_STRAIGHT_CASCADE_POS_KP;
+            float pos_ki = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_POS_KI : Q6_STRAIGHT_CASCADE_POS_KI;
+            float pos_kd = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_POS_KD : Q6_STRAIGHT_CASCADE_POS_KD;
+            float pos_int_limit = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_POS_INT_LIMIT :
+                Q6_STRAIGHT_CASCADE_POS_INT_LIMIT;
+            float target_speed_max = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S :
+                Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S;
+            float speed_kp = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_SPEED_KP : Q6_STRAIGHT_CASCADE_SPEED_KP;
+            float speed_ki = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_SPEED_KI : Q6_STRAIGHT_CASCADE_SPEED_KI;
+            float speed_kd = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_SPEED_KD : Q6_STRAIGHT_CASCADE_SPEED_KD;
+            float speed_int_limit = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_SPEED_INT_LIMIT :
+                Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT;
+            float angle_max = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_ANGLE_MAX_DEG :
+                Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG;
+            float deadband_mm = g_q7_hold_active ?
+                Q7_STRAIGHT_CASCADE_DEADBAND_MM :
+                Q6_STRAIGHT_CASCADE_DEADBAND_MM;
+            float target_bias_mm = g_q7_hold_active ?
+                Q7_STRAIGHT_TARGET_BIAS_MM : Q6_STRAIGHT_TARGET_BIAS_MM;
 
             /* Shift only the mode-3 straight target toward the hinge end. */
-            pos_error += Q6_STRAIGHT_TARGET_BIAS_MM;
+            pos_error += target_bias_mm;
 
             /* Mode-3 straight position outer loop: command a gentle return speed. */
-            if (abs_f32(pos_error) <= Q6_STRAIGHT_CASCADE_DEADBAND_MM) {
+            if (abs_f32(pos_error) <= deadband_mm) {
                 pos_error = 0.0f;
                 g_q6_straight_position_integral *= 0.85f;
             } else {
                 g_q6_straight_position_integral += pos_error * dt_s;
                 g_q6_straight_position_integral = clamp_f32_ball(
                     g_q6_straight_position_integral,
-                    -Q6_STRAIGHT_CASCADE_POS_INT_LIMIT,
-                    Q6_STRAIGHT_CASCADE_POS_INT_LIMIT);
+                    -pos_int_limit, pos_int_limit);
             }
             target_velocity_mm_s =
-                (Q6_STRAIGHT_CASCADE_POS_KP * pos_error) +
-                (Q6_STRAIGHT_CASCADE_POS_KI *
+                (pos_kp * pos_error) +
+                (pos_ki *
                     g_q6_straight_position_integral) -
-                (Q6_STRAIGHT_CASCADE_POS_KD * control_velocity_mm_s);
+                (pos_kd * control_velocity_mm_s);
             target_velocity_mm_s = clamp_f32_ball(target_velocity_mm_s,
-                -Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S,
-                Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S);
+                -target_speed_max, target_speed_max);
 
             /* Mode-3 straight speed inner loop: convert speed error to angle. */
             speed_error = target_velocity_mm_s - control_velocity_mm_s;
             g_q6_straight_speed_integral += speed_error * dt_s;
             g_q6_straight_speed_integral = clamp_f32_ball(
                 g_q6_straight_speed_integral,
-                -Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT,
-                Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT);
+                -speed_int_limit, speed_int_limit);
             speed_derivative =
                 (speed_error - g_q6_straight_last_speed_error) / dt_s;
             speed_derivative = clamp_f32_ball(speed_derivative,
                 -pid_cfg->accel_limit, pid_cfg->accel_limit);
             g_q6_straight_last_speed_error = speed_error;
             g_feedback_deg = -(
-                (Q6_STRAIGHT_CASCADE_SPEED_KP * speed_error) +
-                (Q6_STRAIGHT_CASCADE_SPEED_KI *
+                (speed_kp * speed_error) +
+                (speed_ki *
                     g_q6_straight_speed_integral) +
-                (Q6_STRAIGHT_CASCADE_SPEED_KD * speed_derivative));
+                (speed_kd * speed_derivative));
             g_feedback_deg = clamp_f32_ball(g_feedback_deg,
-                -Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG,
-                Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG);
+                -angle_max, angle_max);
             apply_pipe_command();
             return;
         }

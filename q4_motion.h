@@ -22,7 +22,8 @@ typedef struct {
 
 typedef enum {
     Q4_MOTION_PROFILE_CENTER = 0,
-    Q4_MOTION_PROFILE_ARBITRARY
+    Q4_MOTION_PROFILE_ARBITRARY,
+    Q4_MOTION_PROFILE_Q7_ARBITRARY
 } Q4MotionProfile;
 
 void q4_motion_init(void);

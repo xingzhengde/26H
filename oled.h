@@ -370,13 +370,21 @@ static inline void oled_show_line_mode(uint32_t run_time_ms, bool started,
     char line[20];
 
     oled_puts_fixed(0U, 0U, "26H CAR", 21U);
-    if (competition_mode == 3U) {
+    if (competition_mode == 4U) {
         if (paused) {
-            oled_puts_fixed(2U, 0U, "M3 Q6 ANY PAUSE", 21U);
+            oled_puts_fixed(2U, 0U, "M4 Q7 ANY PAUSE", 21U);
         } else {
             oled_puts_fixed(2U, 0U, started ?
-                (running ? "M3 Q6 ANY RUN" : "M3 Q6 ANY DONE") :
-                "M3 Q6 ANY READY", 21U);
+                (running ? "M4 Q7 ANY RUN" : "M4 Q7 ANY DONE") :
+                "M4 Q7 ANY READY", 21U);
+        }
+    } else if (competition_mode == 3U) {
+        if (paused) {
+            oled_puts_fixed(2U, 0U, "M3 Q6 CENTER PAUSE", 21U);
+        } else {
+            oled_puts_fixed(2U, 0U, started ?
+                (running ? "M3 Q6 CENTER RUN" : "M3 Q6 CENTER DONE") :
+                "M3 Q6 CENTER READY", 21U);
         }
     } else if (competition_mode == 2U) {
         if (paused) {

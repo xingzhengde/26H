@@ -24,6 +24,7 @@ typedef enum {
     APP_MODE_LINE_TIMER = 0,
     APP_MODE_Q4_AB,
     APP_MODE_Q6_ARBITRARY,
+    APP_MODE_Q7_ARBITRARY,
     APP_MODE_COUNT,
     /*
      * 保留步进机构调试代码，但不放入 B5 的比赛模式循环。
@@ -135,6 +136,26 @@ static const LineModeParams g_q6_mode_params = {
     Q6_A_MARK_FRAMES,
     Q6_A_MIN_LAP_MS,
     Q6_A_MIN_LAP_COUNTS
+};
+
+static const LineModeParams g_q7_mode_params = {
+    0.0f,
+    0.0f,
+    0.0f,
+    Q7_CRUISE_TARGET_COUNTS,
+    Q7_CRUISE_BASE_PWM,
+    Q7_LEFT_PWM_TRIM,
+    Q7_RIGHT_PWM_TRIM,
+    Q7_BRAKE_MS,
+    Q7_LINE_KP,
+    Q7_LINE_KD,
+    Q7_LINE_CORR_LIMIT,
+    Q7_LINE_SEARCH_PWM,
+    Q7_A_MARK_TOTAL,
+    Q7_A_MARK_SPAN,
+    Q7_A_MARK_FRAMES,
+    Q7_A_MIN_LAP_MS,
+    Q7_A_MIN_LAP_COUNTS
 };
 
 static const StepperModeParams g_stepper_mode_params = {
@@ -281,6 +302,7 @@ static float clamp_f32(float value, float min_value, float max_value)
 static float q6_curve_feedforward_update(float current_deg,
                                          int16_t line_error,
                                          bool line_valid,
+                                         bool q7_mode,
                                          uint32_t now_ms,
                                          bool *curve_active,
                                          uint32_t *curve_candidate_ms,
@@ -290,14 +312,34 @@ static float q6_curve_feedforward_update(float current_deg,
     float target_deg = 0.0f;
     int32_t error_abs = (line_error < 0) ?
         -(int32_t)line_error : (int32_t)line_error;
+    bool enabled = q7_mode ? (Q7_CURVE_FF_ENABLE != 0) :
+        (Q6_CURVE_FF_ENABLE != 0);
+    int32_t entry_err = q7_mode ? Q7_CURVE_FF_ENTRY_ERR :
+        Q6_CURVE_FF_ENTRY_ERR;
+    uint32_t entry_confirm_ms = q7_mode ? Q7_CURVE_FF_ENTRY_CONFIRM_MS :
+        Q6_CURVE_FF_ENTRY_CONFIRM_MS;
+    uint32_t min_hold_ms = q7_mode ? Q7_CURVE_FF_MIN_HOLD_MS :
+        Q6_CURVE_FF_MIN_HOLD_MS;
+    int32_t exit_err = q7_mode ? Q7_CURVE_FF_EXIT_ERR :
+        Q6_CURVE_FF_EXIT_ERR;
+    uint32_t exit_confirm_ms = q7_mode ? Q7_CURVE_FF_EXIT_CONFIRM_MS :
+        Q6_CURVE_FF_EXIT_CONFIRM_MS;
+    int32_t full_err = q7_mode ? Q7_CURVE_FF_FULL_ERR :
+        Q6_CURVE_FF_FULL_ERR;
+    float max_deg = q7_mode ? Q7_CURVE_FF_MAX_DEG : Q6_CURVE_FF_MAX_DEG;
+    float hold_deg = q7_mode ? Q7_CURVE_FF_HOLD_DEG : Q6_CURVE_FF_HOLD_DEG;
+    float sign = q7_mode ? Q7_CURVE_FF_SIGN : Q6_CURVE_FF_SIGN;
+    float attack_new = q7_mode ? Q7_CURVE_FF_ATTACK_NEW :
+        Q6_CURVE_FF_ATTACK_NEW;
+    float release_new = q7_mode ? Q7_CURVE_FF_RELEASE_NEW :
+        Q6_CURVE_FF_RELEASE_NEW;
 
-#if Q6_CURVE_FF_ENABLE
-    if (!*curve_active) {
-        if (line_valid && (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
+    if (enabled && !*curve_active) {
+        if (line_valid && (error_abs >= entry_err)) {
             if (*curve_candidate_ms == 0U) {
                 *curve_candidate_ms = now_ms;
             } else if ((now_ms - *curve_candidate_ms) >=
-                       Q6_CURVE_FF_ENTRY_CONFIRM_MS) {
+                       entry_confirm_ms) {
                 *curve_active = true;
                 *curve_enter_ms = now_ms;
                 *curve_candidate_ms = 0U;
@@ -306,17 +348,17 @@ static float q6_curve_feedforward_update(float current_deg,
         } else {
             *curve_candidate_ms = 0U;
         }
-    } else if (line_valid &&
-               (error_abs >= Q6_CURVE_FF_ENTRY_ERR)) {
+    } else if (enabled && line_valid &&
+               (error_abs >= entry_err)) {
         *straight_since_ms = 0U;
     } else if (*curve_active && line_valid &&
                ((now_ms - *curve_enter_ms) >=
-                Q6_CURVE_FF_MIN_HOLD_MS) &&
-               (error_abs <= Q6_CURVE_FF_EXIT_ERR)) {
+                min_hold_ms) &&
+               (error_abs <= exit_err)) {
         if (*straight_since_ms == 0U) {
             *straight_since_ms = now_ms;
         } else if ((now_ms - *straight_since_ms) >=
-                   Q6_CURVE_FF_EXIT_CONFIRM_MS) {
+                   exit_confirm_ms) {
             *curve_active = false;
             *straight_since_ms = 0U;
         }
@@ -324,26 +366,18 @@ static float q6_curve_feedforward_update(float current_deg,
         *straight_since_ms = 0U;
     }
 
-    if (*curve_active) {
-        float ratio = (float)(error_abs - Q6_CURVE_FF_ENTRY_ERR) /
-            (float)(Q6_CURVE_FF_FULL_ERR - Q6_CURVE_FF_ENTRY_ERR);
+    if (enabled && *curve_active) {
+        float ratio = (float)(error_abs - entry_err) /
+            (float)(full_err - entry_err);
         float demand_deg;
 
         ratio = clamp_f32(ratio, 0.0f, 1.0f);
-        demand_deg = Q6_CURVE_FF_MAX_DEG * ratio;
-        if (demand_deg < Q6_CURVE_FF_HOLD_DEG) {
-            demand_deg = Q6_CURVE_FF_HOLD_DEG;
+        demand_deg = max_deg * ratio;
+        if (demand_deg < hold_deg) {
+            demand_deg = hold_deg;
         }
-        target_deg = Q6_CURVE_FF_SIGN * demand_deg;
+        target_deg = sign * demand_deg;
     }
-#else
-    (void)error_abs;
-    (void)now_ms;
-    (void)curve_active;
-    (void)curve_candidate_ms;
-    (void)curve_enter_ms;
-    (void)straight_since_ms;
-#endif
 
     {
         float current_abs = (current_deg < 0.0f) ?
@@ -351,7 +385,7 @@ static float q6_curve_feedforward_update(float current_deg,
         float target_abs = (target_deg < 0.0f) ?
             -target_deg : target_deg;
         float filter_new = (target_abs > current_abs) ?
-            Q6_CURVE_FF_ATTACK_NEW : Q6_CURVE_FF_RELEASE_NEW;
+            attack_new : release_new;
 
         current_deg += filter_new * (target_deg - current_deg);
     }
@@ -400,9 +434,11 @@ static const char *app_mode_name(AppMode mode)
     case APP_MODE_Q4_AB:
         return "M2 Q4";
     case APP_MODE_Q6_ARBITRARY:
-        return "M3 Q6 ANY";
+        return "M3 Q6 CENTER";
+    case APP_MODE_Q7_ARBITRARY:
+        return "M4 Q7 ANY";
     case APP_MODE_STEPPER_MANUAL:
-        return "M4 STEPPER";
+        return "M5 STEPPER";
     default:
         return "UNKNOWN";
     }
@@ -447,10 +483,21 @@ static void apply_q6_mode_params(TuneParams *tune)
     apply_drive_mode_params(tune, &g_q6_mode_params);
 }
 
+static void apply_q7_mode_params(TuneParams *tune)
+{
+    apply_drive_mode_params(tune, &g_q7_mode_params);
+}
+
+static bool app_mode_is_q6_family(AppMode mode)
+{
+    return (mode == APP_MODE_Q6_ARBITRARY) ||
+        (mode == APP_MODE_Q7_ARBITRARY);
+}
+
 static bool app_mode_is_ball_drive(AppMode mode)
 {
     return (mode == APP_MODE_Q4_AB) ||
-        (mode == APP_MODE_Q6_ARBITRARY);
+        app_mode_is_q6_family(mode);
 }
 
 static void stepper_jog_buttons_service(const StepperModeParams *params)
@@ -1005,17 +1052,19 @@ int main(void)
                 apply_q4_mode_params(&tune);
             } else if (app_mode == APP_MODE_Q6_ARBITRARY) {
                 apply_q6_mode_params(&tune);
+            } else if (app_mode == APP_MODE_Q7_ARBITRARY) {
+                apply_q7_mode_params(&tune);
             }
             debug_print_mode("MODE SWITCH", app_mode);
         }
 
         if (b15_press_event()) {
             debug_print_keys("KEY K4 START", &tune);
-            if ((app_mode == APP_MODE_Q6_ARBITRARY) &&
+            if (app_mode_is_q6_family(app_mode) &&
                 !q4_preload_pending && !tune.run &&
                 (!k230_control_ok || (k230_control.mode != 7U) ||
                  (k230_control.run_state != 1U))) {
-                debug_puts("MODE Q6 BLOCK K230 STATE7 NOT RUN\r\n");
+                debug_puts("MODE Q6/Q7 BLOCK K230 STATE7 NOT RUN\r\n");
             } else if (app_mode == APP_MODE_LINE_TIMER) {
                 if (tune.run) {
                     line_paused = true;
@@ -1052,7 +1101,7 @@ int main(void)
                     line_paused = true;
                     q4_motion_stop();
                     ball_balance_set_feedforward(0.0f);
-                    if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                    if (app_mode_is_q6_family(app_mode)) {
                         q6_curve_feedforward_deg = 0.0f;
                         q6_curve_active = false;
                         q6_curve_candidate_ms = 0U;
@@ -1072,15 +1121,23 @@ int main(void)
                     /* 预置期间底盘必须保持停止，运动计时到真正起步时再清零。 */
                     stop_line_outputs(&tune);
                     q4_motion_select_profile(
-                        (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                        Q4_MOTION_PROFILE_ARBITRARY :
-                        Q4_MOTION_PROFILE_CENTER);
-                    if (app_mode == APP_MODE_Q6_ARBITRARY) {
-                        ball_balance_hold_q6(clamp_f32(
-                            (float)k230_control.target_mm,
-                            -150.0f, 150.0f));
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q4_MOTION_PROFILE_Q7_ARBITRARY :
+                        ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                         Q4_MOTION_PROFILE_ARBITRARY :
+                         Q4_MOTION_PROFILE_CENTER));
+                    if (app_mode_is_q6_family(app_mode)) {
+                        if (app_mode == APP_MODE_Q7_ARBITRARY) {
+                            ball_balance_hold_q7(clamp_f32(
+                                (float)k230_control.target_mm,
+                                -150.0f, 150.0f));
+                        } else {
+                            /* Mode 3 always holds the calibrated center. */
+                            ball_balance_hold_q6(0.0f);
+                        }
                         q6_curve_feedforward_deg = 0.0f;
                         q6_curve_active = false;
+                        q6_curve_candidate_ms = 0U;
                         q6_curve_enter_ms = 0U;
                         q6_straight_since_ms = 0U;
                         ball_balance_set_curve_feedforward(0.0f);
@@ -1137,7 +1194,7 @@ int main(void)
                 q4_motion_start(g_ms_ticks);
                 q4_preload_pending = false;
                 line_paused = false;
-                if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                if (app_mode_is_q6_family(app_mode)) {
                     line_lap_phase = LINE_LAP_RUNNING;
                     a_confirm_frames = 0U;
                     a_release_frames = 0U;
@@ -1234,15 +1291,21 @@ int main(void)
                 drive_ramp_ratio = q4_setpoint.ramp_ratio;
                 ball_balance_set_feedforward(
                     q4_setpoint.pipe_feedforward_deg);
-                if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                if (app_mode_is_q6_family(app_mode)) {
                     float feedback_scale = 0.0f;
+                    uint32_t initial_hold_ms =
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_INITIAL_ANGLE_HOLD_MS : Q6_INITIAL_ANGLE_HOLD_MS;
+                    uint32_t feedback_blend_ms =
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_BALL_FEEDBACK_BLEND_MS : Q6_BALL_FEEDBACK_BLEND_MS;
 
                     if (q4_setpoint.elapsed_ms >
-                        Q6_INITIAL_ANGLE_HOLD_MS) {
+                        initial_hold_ms) {
                         feedback_scale = (float)(
                             q4_setpoint.elapsed_ms -
-                            Q6_INITIAL_ANGLE_HOLD_MS) /
-                            (float)Q6_BALL_FEEDBACK_BLEND_MS;
+                            initial_hold_ms) /
+                            (float)feedback_blend_ms;
                     }
                     ball_balance_set_feedback_scale(clamp_f32(
                         feedback_scale, 0.0f, 1.0f));
@@ -1261,7 +1324,7 @@ int main(void)
             }
 
             if (((app_mode == APP_MODE_LINE_TIMER) ||
-                 (app_mode == APP_MODE_Q6_ARBITRARY)) &&
+                 app_mode_is_q6_family(app_mode)) &&
                 (line_lap_phase == LINE_LAP_RUNNING)) {
                 uint32_t left_abs = (left_delta < 0) ?
                     (uint32_t)(-left_delta) : (uint32_t)left_delta;
@@ -1277,15 +1340,19 @@ int main(void)
                 float base_target;
                 int16_t speed_delta;
                 int16_t curve_error_start =
-                    (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                    Q6_LINE_CURVE_ERR_START :
+                    (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                    Q7_LINE_CURVE_ERR_START :
+                    ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                     Q6_LINE_CURVE_ERR_START :
                     ((app_mode == APP_MODE_Q4_AB) ?
-                     Q4_LINE_CURVE_ERR_START : LINE_CURVE_ERR_START);
+                     Q4_LINE_CURVE_ERR_START : LINE_CURVE_ERR_START));
                 float curve_target_drop =
-                    (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                    Q6_LINE_CURVE_TARGET_DROP :
+                    (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                    Q7_LINE_CURVE_TARGET_DROP :
+                    ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                     Q6_LINE_CURVE_TARGET_DROP :
                     ((app_mode == APP_MODE_Q4_AB) ?
-                     Q4_LINE_CURVE_TARGET_DROP : LINE_CURVE_TARGET_DROP);
+                     Q4_LINE_CURVE_TARGET_DROP : LINE_CURVE_TARGET_DROP));
 
                 gray_raw = gray_sensor_read_raw();
                 speed_delta = line_tracker_update(&tracker, gray_raw,
@@ -1299,13 +1366,19 @@ int main(void)
                 tune.line_correction = speed_delta;
                 tune.line_valid = tracker.valid;
 
-                if (app_mode == APP_MODE_Q6_ARBITRARY) {
+                if (app_mode_is_q6_family(app_mode)) {
+                    uint32_t curve_arm_delay_ms =
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_CURVE_ARM_DELAY_MS : Q6_CURVE_ARM_DELAY_MS;
+
                     if (q4_setpoint.elapsed_ms >=
-                        Q6_CURVE_ARM_DELAY_MS) {
+                        curve_arm_delay_ms) {
                         q6_curve_feedforward_deg =
                             q6_curve_feedforward_update(
                                 q6_curve_feedforward_deg,
-                                tracker.error, tracker.valid, g_ms_ticks,
+                                tracker.error, tracker.valid,
+                                app_mode == APP_MODE_Q7_ARBITRARY,
+                                g_ms_ticks,
                                 &q6_curve_active,
                                 &q6_curve_candidate_ms,
                                 &q6_curve_enter_ms,
@@ -1351,7 +1424,7 @@ int main(void)
                 }
 
                 if (((app_mode == APP_MODE_LINE_TIMER) ||
-                     (app_mode == APP_MODE_Q6_ARBITRARY)) &&
+                     app_mode_is_q6_family(app_mode)) &&
                     (line_lap_phase != LINE_LAP_IDLE) &&
                     (line_lap_phase != LINE_LAP_FINISHED)) {
                     AMarkStats a_stats = line_a_mark_update(gray_raw, &tune);
@@ -1448,7 +1521,7 @@ int main(void)
                             g_run_timer_enabled = false;
                             line_lap_phase = LINE_LAP_FINISHED;
                             mode_started = true;
-                            if (app_mode != APP_MODE_Q6_ARBITRARY) {
+                            if (!app_mode_is_q6_family(app_mode)) {
                                 tune.run = false;
                                 tune.line_active = false;
                                 tune.brake_request = true;
@@ -1492,17 +1565,24 @@ int main(void)
                         -(int32_t)tune.line_error :
                         (int32_t)tune.line_error;
                     int16_t line_pwm_limit =
-                        (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                        Q6_LINE_PWM_LIMIT : Q4_LINE_PWM_LIMIT;
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_LINE_PWM_LIMIT :
+                        ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                         Q6_LINE_PWM_LIMIT : Q4_LINE_PWM_LIMIT);
                     int16_t curve_error_start =
-                        (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                        Q6_LINE_CURVE_ERR_START : Q4_LINE_CURVE_ERR_START;
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_LINE_CURVE_ERR_START :
+                        ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                         Q6_LINE_CURVE_ERR_START : Q4_LINE_CURVE_ERR_START);
                     int16_t curve_pwm_drop =
-                        (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                        Q6_LINE_CURVE_PWM_DROP : Q4_LINE_CURVE_PWM_DROP;
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                        Q7_LINE_CURVE_PWM_DROP :
+                        ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                         Q6_LINE_CURVE_PWM_DROP : Q4_LINE_CURVE_PWM_DROP);
                     int16_t start_pwm =
-                        (app_mode == APP_MODE_Q6_ARBITRARY) ?
-                        Q6_START_PWM : Q4_START_PWM;
+                        (app_mode == APP_MODE_Q7_ARBITRARY) ? Q7_START_PWM :
+                        ((app_mode == APP_MODE_Q6_ARBITRARY) ?
+                         Q6_START_PWM : Q4_START_PWM);
 
                     /*
                      * 模式二彻底绕过速度 PID。唯一主命令是 q4_motion 生成的
@@ -1555,10 +1635,12 @@ int main(void)
              * 瞬间给出大误差，输出也只能逐步增加，不可能突然冲到高转速。
              */
             {
-                int16_t pwm_step = (app_mode == APP_MODE_Q6_ARBITRARY) ?
+                int16_t pwm_step = (app_mode == APP_MODE_Q7_ARBITRARY) ?
+                    Q7_PWM_STEP_LIMIT :
+                    ((app_mode == APP_MODE_Q6_ARBITRARY) ?
                     Q6_PWM_STEP_LIMIT :
                     ((app_mode == APP_MODE_Q4_AB) ?
-                     Q4_PWM_STEP_LIMIT : PWM_STEP_LIMIT);
+                     Q4_PWM_STEP_LIMIT : PWM_STEP_LIMIT));
 
                 left_pwm = ramp_to(left_pwm, clamp_pwm(target_left_pwm),
                     pwm_step);
@@ -1619,7 +1701,7 @@ int main(void)
             }
             if (app_mode == APP_MODE_Q4_AB) {
                 status_flags |= K230_MCU_FLAG_MODE_Q4;
-            } else if (app_mode == APP_MODE_Q6_ARBITRARY) {
+            } else if (app_mode_is_q6_family(app_mode)) {
                 status_flags |= K230_MCU_FLAG_MODE_Q6;
             }
 
