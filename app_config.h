@@ -107,7 +107,7 @@
  * Q4_* 的宏别名，确保后续实车整定任意位置保持时不会改变模式二。
  */
 #define Q6_LAP_TARGET_TIME_MS     (30000U)
-#define Q6_ACCEL_TIME_MS          (2500U)
+#define Q6_ACCEL_TIME_MS          (4000U)
 #define Q6_CRUISE_TARGET_COUNTS   (150.0f)
 #define Q6_START_PWM              (200)
 #define Q6_CRUISE_BASE_PWM        (400)
@@ -127,7 +127,7 @@
 #define Q6_MAX_FEEDFORWARD_DEG    (3.0f)
 #define Q6_FEEDFORWARD_ENABLE     (1)
 #define Q6_INITIAL_ANGLE_DEG      (1.70f)
-#define Q6_INITIAL_ANGLE_HOLD_MS  (100U)
+#define Q6_INITIAL_ANGLE_HOLD_MS  (300U)
 #define Q6_BALL_FEEDBACK_BLEND_MS (400U)
 #define Q6_PRELOAD_LEAD_MS        (100U)
 #define Q6_INITIAL_ANGLE_RATE_DEG_S (240.0f)
@@ -163,17 +163,17 @@
 #define Q6_CURVE_TARGET_BIAS_MM    (5.0f)
 
 /* Mode-3 straight cascade PID, independent from the proven curve settings. */
-#define Q6_STRAIGHT_CASCADE_POS_KP (1.10f)
-#define Q6_STRAIGHT_CASCADE_POS_KI (0.010f)
-#define Q6_STRAIGHT_CASCADE_POS_KD (0.08f)
-#define Q6_STRAIGHT_CASCADE_POS_INT_LIMIT (60.0f)
-#define Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S (40.0f)
-#define Q6_STRAIGHT_CASCADE_SPEED_KP (0.035f)
-#define Q6_STRAIGHT_CASCADE_SPEED_KI (0.0008f)
-#define Q6_STRAIGHT_CASCADE_SPEED_KD (0.00010f)
-#define Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT (80.0f)
-#define Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.50f)
-#define Q6_STRAIGHT_CASCADE_DEADBAND_MM (1.5f)
+#define Q6_STRAIGHT_CASCADE_POS_KP (0.65f)
+#define Q6_STRAIGHT_CASCADE_POS_KI (0.003f)
+#define Q6_STRAIGHT_CASCADE_POS_KD (0.12f)
+#define Q6_STRAIGHT_CASCADE_POS_INT_LIMIT (30.0f)
+#define Q6_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S (22.0f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KP (0.055f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KI (0.0003f)
+#define Q6_STRAIGHT_CASCADE_SPEED_KD (0.00005f)
+#define Q6_STRAIGHT_CASCADE_SPEED_INT_LIMIT (40.0f)
+#define Q6_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.20f)
+#define Q6_STRAIGHT_CASCADE_DEADBAND_MM (2.0f)
 /* +x is the hinge end; compensate mode-3 straight equilibrium only. */
 #define Q6_STRAIGHT_TARGET_BIAS_MM (8.0f)
 
@@ -187,6 +187,31 @@
 #define Q6_STICTION_PULSE_MS           (180U)
 #define Q6_STICTION_COOLDOWN_MS        (300U)
 #define Q6_STICTION_BOOST_DEG          (0.15f)
+
+/* Mode-3 visual mean-error learner, independent for straight and curve. */
+#define Q6_ADAPTIVE_BIAS_ENABLE              (1)
+#define Q6_ADAPTIVE_BIAS_DEADBAND_MM         (3.0f)
+#define Q6_ADAPTIVE_BIAS_MAX_MM              (12.0f)
+#define Q6_ADAPTIVE_BIAS_RATE_PER_S          (0.10f)
+#define Q6_ADAPTIVE_BIAS_MEAN_TAU_MS         (800U)
+#define Q6_ADAPTIVE_BIAS_QUALIFY_MS          (800U)
+#define Q6_ADAPTIVE_BIAS_POSITION_WINDOW_MM  (40.0f)
+#define Q6_ADAPTIVE_BIAS_SPEED_MAX_MM_S      (80.0f)
+
+/* Mode-3 straight acceleration loop: fast visual observer plus latency lead. */
+#define Q6_VISUAL_ACCEL_FB_ENABLE             (1)
+#define Q6_VISUAL_ACCEL_FB_KP_DEG_PER_MM_S2   (0.0010f)
+#define Q6_VISUAL_ACCEL_FB_MAX_DEG            (0.45f)
+#define Q6_VISUAL_ACCEL_FB_SIGN               (1.0f)
+#define Q6_VISUAL_ACCEL_OBSERVER_NEW          (0.70f)
+#define Q6_VISUAL_ACCEL_JERK_LIMIT_MM_S3      (3000.0f)
+#define Q6_VISUAL_ACCEL_PREDICT_MAX_MS        (80U)
+#define Q6_VISUAL_ACCEL_INPUT_LIMIT_MM_S2     (500.0f)
+
+/* Immediate chassis-acceleration feedforward; 180/(pi*g) is about 5.84. */
+#define Q6_DRIVE_ACCEL_FF_GAIN_DEG_PER_MPS2   (5.84f)
+#define Q6_DRIVE_ACCEL_FF_MAX_DEG             (0.50f)
+#define Q6_DRIVE_ACCEL_FF_SIGN                (1.0f)
 
 #define Q6_BALL_POS_KP            (0.080f)
 #define Q6_BALL_POS_KI            (0.004f)
@@ -222,7 +247,7 @@
  * so later Q7 tuning cannot change the proven mode-3 behavior.
  */
 #define Q7_LAP_TARGET_TIME_MS     (30000U)
-#define Q7_ACCEL_TIME_MS          (2500U)
+#define Q7_ACCEL_TIME_MS          (4000U)
 #define Q7_CRUISE_TARGET_COUNTS   (150.0f)
 #define Q7_START_PWM              (200)
 #define Q7_CRUISE_BASE_PWM        (400)
@@ -242,7 +267,7 @@
 #define Q7_MAX_FEEDFORWARD_DEG    (3.0f)
 #define Q7_FEEDFORWARD_ENABLE     (1)
 #define Q7_INITIAL_ANGLE_DEG      (1.70f)
-#define Q7_INITIAL_ANGLE_HOLD_MS  (100U)
+#define Q7_INITIAL_ANGLE_HOLD_MS  (300U)
 #define Q7_BALL_FEEDBACK_BLEND_MS (400U)
 #define Q7_PRELOAD_LEAD_MS        (100U)
 #define Q7_INITIAL_ANGLE_RATE_DEG_S (240.0f)
@@ -276,17 +301,17 @@
 /* Mode 4 needs slightly more hinge-side correction than mode 3. */
 #define Q7_CURVE_TARGET_BIAS_MM   (10.0f)
 
-#define Q7_STRAIGHT_CASCADE_POS_KP (1.10f)
-#define Q7_STRAIGHT_CASCADE_POS_KI (0.010f)
-#define Q7_STRAIGHT_CASCADE_POS_KD (0.08f)
-#define Q7_STRAIGHT_CASCADE_POS_INT_LIMIT (60.0f)
-#define Q7_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S (40.0f)
-#define Q7_STRAIGHT_CASCADE_SPEED_KP (0.035f)
-#define Q7_STRAIGHT_CASCADE_SPEED_KI (0.0008f)
-#define Q7_STRAIGHT_CASCADE_SPEED_KD (0.00010f)
-#define Q7_STRAIGHT_CASCADE_SPEED_INT_LIMIT (80.0f)
-#define Q7_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.50f)
-#define Q7_STRAIGHT_CASCADE_DEADBAND_MM (1.5f)
+#define Q7_STRAIGHT_CASCADE_POS_KP (0.65f)
+#define Q7_STRAIGHT_CASCADE_POS_KI (0.003f)
+#define Q7_STRAIGHT_CASCADE_POS_KD (0.12f)
+#define Q7_STRAIGHT_CASCADE_POS_INT_LIMIT (30.0f)
+#define Q7_STRAIGHT_CASCADE_TARGET_SPEED_MAX_MM_S (22.0f)
+#define Q7_STRAIGHT_CASCADE_SPEED_KP (0.055f)
+#define Q7_STRAIGHT_CASCADE_SPEED_KI (0.0003f)
+#define Q7_STRAIGHT_CASCADE_SPEED_KD (0.00005f)
+#define Q7_STRAIGHT_CASCADE_SPEED_INT_LIMIT (40.0f)
+#define Q7_STRAIGHT_CASCADE_ANGLE_MAX_DEG (1.20f)
+#define Q7_STRAIGHT_CASCADE_DEADBAND_MM (2.0f)
 #define Q7_STRAIGHT_TARGET_BIAS_MM (13.0f)
 
 /* Mode-4 copy: independent macros allow later mode-specific tuning. */
@@ -299,6 +324,31 @@
 #define Q7_STICTION_PULSE_MS           (180U)
 #define Q7_STICTION_COOLDOWN_MS        (300U)
 #define Q7_STICTION_BOOST_DEG          (0.15f)
+
+/* Mode-4 copy; learns around the K230 arbitrary-position target. */
+#define Q7_ADAPTIVE_BIAS_ENABLE              (1)
+#define Q7_ADAPTIVE_BIAS_DEADBAND_MM         (3.0f)
+#define Q7_ADAPTIVE_BIAS_MAX_MM              (12.0f)
+#define Q7_ADAPTIVE_BIAS_RATE_PER_S          (0.10f)
+#define Q7_ADAPTIVE_BIAS_MEAN_TAU_MS         (800U)
+#define Q7_ADAPTIVE_BIAS_QUALIFY_MS          (800U)
+#define Q7_ADAPTIVE_BIAS_POSITION_WINDOW_MM  (40.0f)
+#define Q7_ADAPTIVE_BIAS_SPEED_MAX_MM_S      (80.0f)
+
+/* Mode-4 independent copy of the straight acceleration loop. */
+#define Q7_VISUAL_ACCEL_FB_ENABLE             (1)
+#define Q7_VISUAL_ACCEL_FB_KP_DEG_PER_MM_S2   (0.0010f)
+#define Q7_VISUAL_ACCEL_FB_MAX_DEG            (0.45f)
+#define Q7_VISUAL_ACCEL_FB_SIGN               (1.0f)
+#define Q7_VISUAL_ACCEL_OBSERVER_NEW          (0.70f)
+#define Q7_VISUAL_ACCEL_JERK_LIMIT_MM_S3      (3000.0f)
+#define Q7_VISUAL_ACCEL_PREDICT_MAX_MS        (80U)
+#define Q7_VISUAL_ACCEL_INPUT_LIMIT_MM_S2     (500.0f)
+
+/* Mode-4 independent chassis-acceleration feedforward. */
+#define Q7_DRIVE_ACCEL_FF_GAIN_DEG_PER_MPS2   (5.84f)
+#define Q7_DRIVE_ACCEL_FF_MAX_DEG             (0.50f)
+#define Q7_DRIVE_ACCEL_FF_SIGN                (1.0f)
 
 /* State-7 LCD target-bias tuning envelope; +x points to hinge end. */
 #define Q67_TARGET_BIAS_TUNE_MIN_MM (-30.0f)

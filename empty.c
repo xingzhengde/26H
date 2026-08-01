@@ -1407,6 +1407,11 @@ int main(void)
                     }
                     ball_balance_set_feedback_scale(clamp_f32(
                         feedback_scale, 0.0f, 1.0f));
+                    ball_balance_set_drive_accel_phase(
+                        q4_setpoint.ramp_ratio < 0.999f,
+                        q4_setpoint.forward_accel_mps2,
+                        q4_setpoint.ramp_ratio,
+                        q4_motion_get_start_feedforward_deg());
                 }
 
                 if (q4_setpoint.passed_b_time &&

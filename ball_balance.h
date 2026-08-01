@@ -46,6 +46,10 @@ bool ball_balance_set_q67_target_biases(float q6_straight_mm,
                                         float q7_curve_mm);
 void ball_balance_set_feedforward(float pipe_angle_deg);
 void ball_balance_set_curve_feedforward(float pipe_angle_deg);
+void ball_balance_set_drive_accel_phase(bool active,
+                                        float planned_accel_mps2,
+                                        float ramp_ratio,
+                                        float startup_angle_deg);
 void ball_balance_set_feedback_scale(float scale);
 void ball_balance_set_initial_feedforward(float pipe_angle_deg);
 void ball_balance_stop(void);

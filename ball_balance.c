@@ -34,6 +34,11 @@ static float g_q6_straight_target_bias_mm;
 static float g_q6_curve_target_bias_mm;
 static float g_q7_straight_target_bias_mm;
 static float g_q7_curve_target_bias_mm;
+static bool g_q67_drive_accel_active;
+static float g_q67_drive_accel_feedforward_deg;
+static float g_q67_fast_accel_mm_s2;
+static float g_q67_fast_jerk_mm_s3;
+static uint8_t g_q67_accel_observer_samples;
 
 typedef enum {
     Q67_STICTION_IDLE = 0,
@@ -45,6 +50,19 @@ typedef enum {
 static Q67StictionPhase g_q67_stiction_phase;
 static uint32_t g_q67_stiction_phase_start_ms;
 static int8_t g_q67_stiction_error_sign;
+
+typedef struct {
+    float mean_error_mm;
+    float learned_bias_mm;
+    uint32_t qualify_start_ms;
+    bool qualifying;
+} Q67AdaptiveBiasState;
+
+/* Straight/curve and mode-3/mode-4 learners are intentionally independent. */
+static Q67AdaptiveBiasState g_q6_straight_adaptive;
+static Q67AdaptiveBiasState g_q6_curve_adaptive;
+static Q67AdaptiveBiasState g_q7_straight_adaptive;
+static Q67AdaptiveBiasState g_q7_curve_adaptive;
 
 /* Mode-5 fixed sequence is private and never selected by modes 1-4. */
 typedef enum {
@@ -142,6 +160,17 @@ static float abs_f32(float value)
     return (value < 0.0f) ? -value : value;
 }
 
+static float q67_effective_drive_accel_feedforward(void)
+{
+    /* The proven fixed startup angle has priority; never double-compensate. */
+    if (!g_q6_hold_active || !g_q67_drive_accel_active ||
+        g_q6_curve_cascade_active ||
+        (abs_f32(g_feedforward_deg) > 0.001f)) {
+        return 0.0f;
+    }
+    return g_q67_drive_accel_feedforward_deg;
+}
+
 /**
  * @brief 把物理水管角转换为当前执行机构命令。
  *
@@ -151,12 +180,14 @@ static float abs_f32(float value)
 static void apply_pipe_command_with_rate(float motor_rate_deg_s)
 {
     float applied_feedback_deg = g_feedback_deg * g_feedback_scale;
+    float drive_accel_ff_deg = q67_effective_drive_accel_feedforward();
     float total_angle = g_feedforward_deg + g_curve_feedforward_deg +
-        applied_feedback_deg;
+        drive_accel_ff_deg + applied_feedback_deg;
 
     total_angle = clamp_f32_ball(total_angle,
         -BALL_SPEED_MAX_THETA, BALL_SPEED_MAX_THETA);
-    g_state.feedforward_deg = g_feedforward_deg + g_curve_feedforward_deg;
+    g_state.feedforward_deg = g_feedforward_deg +
+        g_curve_feedforward_deg + drive_accel_ff_deg;
     g_state.feedback_deg = applied_feedback_deg;
     g_state.theta_deg = total_angle;
     stepper_arm_set_pipe_angle(
@@ -169,6 +200,181 @@ static void reset_q67_stiction_state(void)
     g_q67_stiction_phase = Q67_STICTION_IDLE;
     g_q67_stiction_phase_start_ms = 0U;
     g_q67_stiction_error_sign = 0;
+}
+
+static void reset_one_q67_adaptive_filter(Q67AdaptiveBiasState *state)
+{
+    state->mean_error_mm = 0.0f;
+    state->qualify_start_ms = 0U;
+    state->qualifying = false;
+}
+
+static void reset_q67_adaptive_filters(void)
+{
+    reset_one_q67_adaptive_filter(&g_q6_straight_adaptive);
+    reset_one_q67_adaptive_filter(&g_q6_curve_adaptive);
+    reset_one_q67_adaptive_filter(&g_q7_straight_adaptive);
+    reset_one_q67_adaptive_filter(&g_q7_curve_adaptive);
+}
+
+static void reset_q67_adaptive_all(void)
+{
+    reset_q67_adaptive_filters();
+    g_q6_straight_adaptive.learned_bias_mm = 0.0f;
+    g_q6_curve_adaptive.learned_bias_mm = 0.0f;
+    g_q7_straight_adaptive.learned_bias_mm = 0.0f;
+    g_q7_curve_adaptive.learned_bias_mm = 0.0f;
+}
+
+static void reset_q67_accel_observer(void)
+{
+    g_q67_fast_accel_mm_s2 = 0.0f;
+    g_q67_fast_jerk_mm_s3 = 0.0f;
+    g_q67_accel_observer_samples = 0U;
+}
+
+/**
+ * Use the newest velocity difference with a high new-sample weight. The jerk
+ * estimate is retained so the controller can lead the camera/actuator delay.
+ */
+static void update_q67_accel_observer(float raw_accel_mm_s2, float dt_s)
+{
+    bool q7 = g_q7_hold_active;
+    float observer_new = q7 ? Q7_VISUAL_ACCEL_OBSERVER_NEW :
+                              Q6_VISUAL_ACCEL_OBSERVER_NEW;
+    float jerk_limit = q7 ? Q7_VISUAL_ACCEL_JERK_LIMIT_MM_S3 :
+                            Q6_VISUAL_ACCEL_JERK_LIMIT_MM_S3;
+    float previous_accel;
+
+    if (!g_q6_hold_active) {
+        return;
+    }
+    if (g_q67_accel_observer_samples < 2U) {
+        g_q67_accel_observer_samples++;
+        g_q67_fast_accel_mm_s2 = 0.0f;
+        g_q67_fast_jerk_mm_s3 = 0.0f;
+        return;
+    }
+
+    previous_accel = g_q67_fast_accel_mm_s2;
+    g_q67_fast_accel_mm_s2 =
+        ((1.0f - observer_new) * previous_accel) +
+        (observer_new * raw_accel_mm_s2);
+    g_q67_fast_jerk_mm_s3 = clamp_f32_ball(
+        (g_q67_fast_accel_mm_s2 - previous_accel) / dt_s,
+        -jerk_limit, jerk_limit);
+}
+
+/**
+ * Acceleration target is zero relative motion in the pipe. Positive visual
+ * acceleration is toward the hinge, so a positive pipe angle opposes it.
+ */
+static float apply_q67_visual_accel_feedback(float feedback_deg,
+                                              float lookahead_s,
+                                              float angle_max_deg)
+{
+    bool q7 = g_q7_hold_active;
+    bool enabled = q7 ? (Q7_VISUAL_ACCEL_FB_ENABLE != 0) :
+                        (Q6_VISUAL_ACCEL_FB_ENABLE != 0);
+    float kp = q7 ? Q7_VISUAL_ACCEL_FB_KP_DEG_PER_MM_S2 :
+                    Q6_VISUAL_ACCEL_FB_KP_DEG_PER_MM_S2;
+    float max_deg = q7 ? Q7_VISUAL_ACCEL_FB_MAX_DEG :
+                         Q6_VISUAL_ACCEL_FB_MAX_DEG;
+    float sign = q7 ? Q7_VISUAL_ACCEL_FB_SIGN :
+                      Q6_VISUAL_ACCEL_FB_SIGN;
+    uint32_t predict_max_ms = q7 ? Q7_VISUAL_ACCEL_PREDICT_MAX_MS :
+                                   Q6_VISUAL_ACCEL_PREDICT_MAX_MS;
+    float input_limit = q7 ? Q7_VISUAL_ACCEL_INPUT_LIMIT_MM_S2 :
+                             Q6_VISUAL_ACCEL_INPUT_LIMIT_MM_S2;
+    float predict_max_s = (float)predict_max_ms / 1000.0f;
+    float predicted_accel_mm_s2;
+    float accel_feedback_deg;
+
+    if (!enabled || !g_q6_hold_active || !g_q67_drive_accel_active ||
+        g_q6_curve_cascade_active || (g_feedback_scale <= 0.01f) ||
+        (g_q67_accel_observer_samples < 2U)) {
+        return feedback_deg;
+    }
+    if (lookahead_s > predict_max_s) {
+        lookahead_s = predict_max_s;
+    }
+    predicted_accel_mm_s2 = g_q67_fast_accel_mm_s2 +
+        (g_q67_fast_jerk_mm_s3 * lookahead_s);
+    predicted_accel_mm_s2 = clamp_f32_ball(predicted_accel_mm_s2,
+        -input_limit, input_limit);
+    accel_feedback_deg = clamp_f32_ball(
+        sign * kp * predicted_accel_mm_s2, -max_deg, max_deg);
+    return clamp_f32_ball(feedback_deg + accel_feedback_deg,
+        -angle_max_deg, angle_max_deg);
+}
+
+/**
+ * Learn only the persistent mean visual error. Oscillation around the target
+ * averages to zero, while an off-centre oscillation slowly shifts the target.
+ */
+static float update_q67_adaptive_bias(uint32_t now_ms, bool curve,
+                                      float true_error_mm,
+                                      float velocity_mm_s, float dt_s)
+{
+    bool q7 = g_q7_hold_active;
+    bool enabled = q7 ? (Q7_ADAPTIVE_BIAS_ENABLE != 0) :
+                        (Q6_ADAPTIVE_BIAS_ENABLE != 0);
+    float deadband_mm = q7 ? Q7_ADAPTIVE_BIAS_DEADBAND_MM :
+                             Q6_ADAPTIVE_BIAS_DEADBAND_MM;
+    float max_bias_mm = q7 ? Q7_ADAPTIVE_BIAS_MAX_MM :
+                             Q6_ADAPTIVE_BIAS_MAX_MM;
+    float rate_per_s = q7 ? Q7_ADAPTIVE_BIAS_RATE_PER_S :
+                            Q6_ADAPTIVE_BIAS_RATE_PER_S;
+    uint32_t tau_ms = q7 ? Q7_ADAPTIVE_BIAS_MEAN_TAU_MS :
+                           Q6_ADAPTIVE_BIAS_MEAN_TAU_MS;
+    uint32_t qualify_ms = q7 ? Q7_ADAPTIVE_BIAS_QUALIFY_MS :
+                               Q6_ADAPTIVE_BIAS_QUALIFY_MS;
+    float position_window_mm = q7 ?
+        Q7_ADAPTIVE_BIAS_POSITION_WINDOW_MM :
+        Q6_ADAPTIVE_BIAS_POSITION_WINDOW_MM;
+    float speed_max_mm_s = q7 ? Q7_ADAPTIVE_BIAS_SPEED_MAX_MM_S :
+                                Q6_ADAPTIVE_BIAS_SPEED_MAX_MM_S;
+    Q67AdaptiveBiasState *state;
+    float tau_s;
+    float alpha;
+
+    if (q7) {
+        state = curve ? &g_q7_curve_adaptive : &g_q7_straight_adaptive;
+    } else {
+        state = curve ? &g_q6_curve_adaptive : &g_q6_straight_adaptive;
+    }
+
+    if (!enabled || !g_q6_hold_active || (g_feedback_scale < 0.95f) ||
+        (g_q67_stiction_phase == Q67_STICTION_PULSE) ||
+        (abs_f32(true_error_mm) > position_window_mm)) {
+        reset_one_q67_adaptive_filter(state);
+        return state->learned_bias_mm;
+    }
+
+    /* Keep the existing mean through fast crossings; learn near turnarounds. */
+    if (abs_f32(velocity_mm_s) > speed_max_mm_s) {
+        return state->learned_bias_mm;
+    }
+
+    if (!state->qualifying) {
+        state->qualifying = true;
+        state->qualify_start_ms = now_ms;
+        state->mean_error_mm = true_error_mm;
+    }
+
+    tau_s = (float)tau_ms / 1000.0f;
+    alpha = dt_s / (tau_s + dt_s);
+    state->mean_error_mm +=
+        alpha * (true_error_mm - state->mean_error_mm);
+
+    if (((now_ms - state->qualify_start_ms) >= qualify_ms) &&
+        (abs_f32(state->mean_error_mm) > deadband_mm)) {
+        state->learned_bias_mm +=
+            rate_per_s * state->mean_error_mm * dt_s;
+        state->learned_bias_mm = clamp_f32_ball(
+            state->learned_bias_mm, -max_bias_mm, max_bias_mm);
+    }
+    return state->learned_bias_mm;
 }
 
 /**
@@ -370,6 +576,10 @@ static void service_q3_mode5_timeline(uint32_t now_ms)
 static void reset_loop_state(void)
 {
     reset_q67_stiction_state();
+    reset_q67_adaptive_all();
+    reset_q67_accel_observer();
+    g_q67_drive_accel_active = false;
+    g_q67_drive_accel_feedforward_deg = 0.0f;
     g_last_sample_timestamp_ms = 0U;
     g_last_frame_id = 0U;
     g_last_frame_time_ms = 0U;
@@ -571,10 +781,51 @@ void ball_balance_set_curve_feedforward(float pipe_angle_deg)
         g_q6_straight_speed_integral = 0.0f;
         g_q6_straight_last_speed_error = 0.0f;
         reset_q67_stiction_state();
+        reset_q67_adaptive_filters();
         g_q6_curve_cascade_active = cascade_active;
     }
     /* 弯道前馈独立叠加，不触发启动阶段的 PID 冻结。 */
     apply_pipe_command();
+}
+
+void ball_balance_set_drive_accel_phase(bool active,
+                                        float planned_accel_mps2,
+                                        float ramp_ratio,
+                                        float startup_angle_deg)
+{
+    bool q7 = g_q7_hold_active;
+    float gain = q7 ? Q7_DRIVE_ACCEL_FF_GAIN_DEG_PER_MPS2 :
+                      Q6_DRIVE_ACCEL_FF_GAIN_DEG_PER_MPS2;
+    float model_max_deg = q7 ? Q7_DRIVE_ACCEL_FF_MAX_DEG :
+                               Q6_DRIVE_ACCEL_FF_MAX_DEG;
+    float total_max_deg = q7 ? Q7_MAX_FEEDFORWARD_DEG :
+                               Q6_MAX_FEEDFORWARD_DEG;
+    float sign = q7 ? Q7_DRIVE_ACCEL_FF_SIGN :
+                      Q6_DRIVE_ACCEL_FF_SIGN;
+    float model_feedforward_deg;
+    float decay_ratio;
+
+    g_q67_drive_accel_active = g_q6_hold_active && active;
+    if (g_q67_drive_accel_active) {
+        model_feedforward_deg = clamp_f32_ball(
+            sign * gain * planned_accel_mps2,
+            -model_max_deg, model_max_deg);
+        ramp_ratio = clamp_f32_ball(ramp_ratio, 0.0f, 1.0f);
+        decay_ratio = 1.0f - ramp_ratio;
+        /* Strong angle disappears early; the model term remains to ramp end. */
+        decay_ratio = decay_ratio * decay_ratio * decay_ratio;
+        startup_angle_deg = clamp_f32_ball(startup_angle_deg,
+            -total_max_deg, total_max_deg);
+        /* Continue startup compensation through the full acceleration ramp. */
+        g_q67_drive_accel_feedforward_deg = model_feedforward_deg +
+            ((startup_angle_deg - model_feedforward_deg) * decay_ratio);
+    } else {
+        g_q67_drive_accel_feedforward_deg = 0.0f;
+    }
+    if (g_q4_hold_active) {
+        /* Apply immediately; do not wait for the next K230 vision frame. */
+        apply_pipe_command();
+    }
 }
 
 void ball_balance_set_feedback_scale(float scale)
@@ -652,6 +903,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     float raw_velocity;
     float raw_accel;
     float pos_error;
+    float true_target_error_mm;
     float control_position_mm;
     float control_velocity_mm_s;
     float lookahead_s;
@@ -679,6 +931,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
      */
     if (!sample_ok || (sample == 0)) {
         reset_q67_stiction_state();
+        reset_q67_adaptive_filters();
+        reset_q67_accel_observer();
         g_last_sample_timestamp_ms = 0U;
         g_have_frame_meta = false;
         g_speed_integral = 0.0f;
@@ -730,6 +984,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     }
     dt_s = (float)sample_dt_ms / 1000.0f;
     if ((dt_s < 0.010f) || (dt_s > 0.250f)) {
+        reset_q67_adaptive_filters();
+        reset_q67_accel_observer();
         g_last_sample_timestamp_ms = sample->timestamp_ms;
         g_last_frame_id = sample->frame_id;
         g_last_frame_time_ms = sample->frame_time_ms;
@@ -753,6 +1009,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     raw_accel = (raw_velocity - g_last_raw_velocity_mm_s) / dt_s;
     raw_accel = clamp_f32_ball(raw_accel,
         -pid_cfg->accel_limit, pid_cfg->accel_limit);
+    update_q67_accel_observer(raw_accel, dt_s);
     g_filtered_accel_mm_s2 =
         ((1.0f - pid_cfg->accel_filter) *
          g_filtered_accel_mm_s2) +
@@ -800,6 +1057,7 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
     control_position_mm = g_state.position_mm + predicted_position_delta;
     control_velocity_mm_s = g_state.velocity_mm_s + predicted_speed_delta;
     pos_error = g_state.target_mm - control_position_mm;
+    true_target_error_mm = pos_error;
 
     if (g_q3_mode5_active) {
         float hold_error_mm;
@@ -904,9 +1162,13 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 Q6_CURVE_CASCADE_DEADBAND_MM;
             float target_bias_mm = g_q7_hold_active ?
                 g_q7_curve_target_bias_mm : g_q6_curve_target_bias_mm;
+            float adaptive_bias_mm = update_q67_adaptive_bias(
+                now_ms, true, true_target_error_mm,
+                control_velocity_mm_s, dt_s);
 
-            /* Compensate the measured curve equilibrium bias toward motor end. */
-            pos_error += target_bias_mm;
+            /* Manual trim plus a slow learner for the measured mean offset. */
+            pos_error = true_target_error_mm + target_bias_mm +
+                adaptive_bias_mm;
 
             /* Position outer loop: position error becomes target ball speed. */
             if (abs_f32(pos_error) <= deadband_mm) {
@@ -981,9 +1243,13 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
             float target_bias_mm = g_q7_hold_active ?
                 g_q7_straight_target_bias_mm :
                 g_q6_straight_target_bias_mm;
+            float adaptive_bias_mm = update_q67_adaptive_bias(
+                now_ms, false, true_target_error_mm,
+                control_velocity_mm_s, dt_s);
 
-            /* Shift only the mode-3 straight target toward the hinge end. */
-            pos_error += target_bias_mm;
+            /* Manual trim plus an independent straight-line mean learner. */
+            pos_error = true_target_error_mm + target_bias_mm +
+                adaptive_bias_mm;
 
             /* Mode-3 straight position outer loop: command a gentle return speed. */
             if (abs_f32(pos_error) <= deadband_mm) {
@@ -1005,6 +1271,13 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
 
             /* Mode-3 straight speed inner loop: convert speed error to angle. */
             speed_error = target_velocity_mm_s - control_velocity_mm_s;
+            if ((speed_error * g_q6_straight_last_speed_error) < 0.0f) {
+                /* Never carry braking torque into the next half-cycle. */
+                g_q6_straight_speed_integral = 0.0f;
+            } else {
+                /* Small leakage prevents a static speed bias storing energy. */
+                g_q6_straight_speed_integral *= 0.995f;
+            }
             g_q6_straight_speed_integral += speed_error * dt_s;
             g_q6_straight_speed_integral = clamp_f32_ball(
                 g_q6_straight_speed_integral,
@@ -1019,6 +1292,8 @@ void ball_balance_update(uint32_t now_ms, bool sample_ok,
                 (speed_ki *
                     g_q6_straight_speed_integral) +
                 (speed_kd * speed_derivative));
+            g_feedback_deg = apply_q67_visual_accel_feedback(
+                g_feedback_deg, lookahead_s, angle_max);
             g_feedback_deg = apply_q67_stiction_boost(
                 now_ms, pos_error, control_velocity_mm_s,
                 g_feedback_deg, angle_max);
